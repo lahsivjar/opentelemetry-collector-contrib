@@ -3,7 +3,6 @@ module github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasti
 go 1.21.1
 
 require (
-	github.com/elastic/apm-tools v0.0.0-20240311133521-f21b8b96fd4b
 	github.com/elastic/go-docappender v1.0.1
 	github.com/elastic/go-elasticsearch/v8 v8.12.1
 	github.com/gorilla/mux v1.8.1
