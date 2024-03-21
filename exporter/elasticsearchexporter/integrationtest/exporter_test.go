@@ -63,7 +63,7 @@ func runner(t *testing.T, restartCollector, mockESFailure bool) {
 			// both collector and ES are unavailable for the same
 			// duration considering worst case scenario. We use a
 			// multiple of flush interval to determine the downtime for
-			// ES. Using a multiple greater than 1 insures that there
+			// ES. Using a multiple greater than 1 ensures that there
 			// is enough downtime to make flush/bulk reqests to ES.
 			time.AfterFunc(10*flushIvl, func() {
 				mockES.SetReturnStatusCode(http.StatusOK)

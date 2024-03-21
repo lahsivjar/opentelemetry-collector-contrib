@@ -67,8 +67,8 @@ func newMockESClient(t testing.TB, debug bool) *mockES {
 	return es
 }
 
-// SetReturnStatusCode simulates a failing elasticsearch. Note that this does
-// not have any impact on the infor (/) request.
+// SetReturnStatusCode simulates a failing Elasticsearch. Note that this does
+// not have any impact on the info (/) request.
 func (m *mockES) SetReturnStatusCode(code int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
