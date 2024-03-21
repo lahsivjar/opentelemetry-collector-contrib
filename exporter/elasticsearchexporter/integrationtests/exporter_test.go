@@ -6,7 +6,7 @@ package integrationtests
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"testing"
 	"time"
@@ -44,16 +44,12 @@ func TestExporter(t *testing.T) {
 func runner(t *testing.T, restartCollector, mockESFailure bool) {
 	t.Helper()
 
-	cfg, err := loadConfig()
+	cfg := loadConfig(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	mockES, err := newMockESClient(t, cfg.Debug)
-	require.NoError(t, err)
-
-	collector, err := newTestCollector(t, cfg, mockES.ServerURL)
-	require.NoError(t, err)
-	t.Cleanup(collector.Shutdown)
+	mockES := newMockESClient(t, cfg.Debug)
+	collector := newTestCollector(t, cfg, mockES.ServerURL)
 
 	var g errgroup.Group
 	cancelRun := runTestCollectorWithWait(ctx, t, collector, &g)
@@ -71,9 +67,7 @@ func runner(t *testing.T, restartCollector, mockESFailure bool) {
 		}
 	}
 
-	var totalLogCount int
-	sendLogs(t, cfg.GRPCEndpoint, "batch_1", 2_000 /* log count */, 10)
-	totalLogCount += 2_000
+	count := sendLogs(t, cfg.GRPCEndpoint, "batch_1", 250, 10) // total=logs*agents
 
 	if restartCollector {
 		// Restart the collector after all data is sent to the collector.
@@ -89,19 +83,18 @@ func runner(t *testing.T, restartCollector, mockESFailure bool) {
 		mockES.SetReturnStatusCode(http.StatusOK)
 	}
 
-	sendLogs(t, cfg.GRPCEndpoint, "batch_2", 2_000 /* log count */, 10)
-	totalLogCount += 2_000
+	count += sendLogs(t, cfg.GRPCEndpoint, "batch_2", 250, 10) // total=logs*agents
 
 	assert.Eventually(
 		t, func() bool {
 			resp, err := mockES.Count(mockES.Count.WithIndex(cfg.ESLogsIndex))
 			require.NoError(t, err)
 
-			body, err := ioutil.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 
 			result := gjson.GetBytes(body, "count")
-			return result.Int() == int64(totalLogCount)
+			return result.Int() == int64(count)
 		}, time.Minute, time.Second,
 	)
 }
@@ -123,16 +116,17 @@ func runTestCollectorWithWait(
 	return rCancel
 }
 
-func sendLogs(t *testing.T, target, uid string, logs, agents int) {
+// sendLogs sends the specified number of logs for each agent. For example
+// with 10 logs and 10 agents we will have 100 total logs sent to the
+// target server. The total number of logs sent is returned.
+func sendLogs(t *testing.T, target, uid string, logs, agents int) int {
 	t.Helper()
 
-	var g errgroup.Group
-	g.SetLimit(10) // This will limit the active goroutines, make this equal to cpu count
-	ctx := context.Background()
-	perRoutineLogCount := int(logs / agents)
+	g, ctx := errgroup.WithContext(context.Background())
+	g.SetLimit(10)
 
 	for i := 0; i < agents; i++ {
-		gID := i
+		id := fmt.Sprintf("%s-%d", uid, i)
 		g.Go(func() error {
 			conn, err := grpc.DialContext(ctx, target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
@@ -141,12 +135,12 @@ func sendLogs(t *testing.T, target, uid string, logs, agents int) {
 			defer conn.Close()
 			client := plogotlp.NewGRPCClient(conn)
 
-			for j := 0; j < perRoutineLogCount; j++ {
+			for j := 0; j < logs; j++ {
 				logs := plog.NewLogs()
 				res := logs.ResourceLogs().AppendEmpty().Resource()
 				res.Attributes().PutStr("source", "otel-esexporter-test")
 				log := logs.ResourceLogs().At(0).ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
-				log.Body().SetStr(fmt.Sprintf("test log %d with agent %d and uid %s", j, gID, uid))
+				log.Body().SetStr(fmt.Sprintf("test log %d with uid %s", j, id))
 				log.SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 				log.SetDroppedAttributesCount(1)
 				log.SetSeverityNumber(plog.SeverityNumberInfo)
@@ -161,4 +155,5 @@ func sendLogs(t *testing.T, target, uid string, logs, agents int) {
 	}
 
 	require.NoError(t, g.Wait())
+	return logs * agents
 }

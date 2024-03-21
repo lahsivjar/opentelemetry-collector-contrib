@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/gorilla/mux"
+	"github.com/stretchr/testify/require"
 
 	"github.com/elastic/go-docappender/docappendertest"
 	"github.com/elastic/go-elasticsearch/v8"
@@ -30,9 +31,14 @@ type mockES struct {
 	mockStatusCode int
 }
 
-func newMockESClient(t testing.TB, debug bool) (*mockES, error) {
+func newMockESClient(t testing.TB, debug bool) *mockES {
 	r := mux.NewRouter()
-	r.Use(esHeaderMiddleware)
+	r.Use(mux.MiddlewareFunc(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Elastic-Product", "Elasticsearch")
+			next.ServeHTTP(w, r)
+		})
+	}))
 	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, `{"version":{"number":"1.2.3"}}`)
 	})
@@ -54,20 +60,11 @@ func newMockESClient(t testing.TB, debug bool) (*mockES, error) {
 	client, err := elasticsearch.NewClient(elasticsearch.Config{
 		Addresses: []string{esURL},
 	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create elasticsearch client: %w", err)
-	}
+	require.NoError(t, err)
 
 	es.ServerURL = esURL
 	es.Client = client
-	return es, nil
-}
-
-func esHeaderMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		next.ServeHTTP(w, r)
-	})
+	return es
 }
 
 // SetReturnStatusCode simulates a failing elasticsearch. Note that this does

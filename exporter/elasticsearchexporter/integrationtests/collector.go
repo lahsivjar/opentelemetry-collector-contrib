@@ -13,6 +13,7 @@ import (
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/confmap/provider/fileprovider"
@@ -35,7 +36,7 @@ type otelCol struct {
 
 // newTestCollector creates a new instance of OTEL collector. The collector wraps
 // the real OTEL collector and provides testing functions on top of it.
-func newTestCollector(t testing.TB, cfg config, esURL string) (*otelCol, error) {
+func newTestCollector(t testing.TB, cfg config, esURL string) *otelCol {
 	var (
 		err       error
 		factories otelcol.Factories
@@ -43,31 +44,21 @@ func newTestCollector(t testing.TB, cfg config, esURL string) (*otelCol, error) 
 	factories.Receivers, err = receiver.MakeFactoryMap(
 		otlpreceiver.NewFactory(),
 	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create OTEL collector: %w", err)
-	}
+	require.NoError(t, err)
 	factories.Extensions, err = extension.MakeFactoryMap(
 		filestorage.NewFactory(),
 	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create OTEL collector: %w", err)
-	}
+	require.NoError(t, err)
 	factories.Exporters, err = exporter.MakeFactoryMap(
 		elasticsearchexporter.NewFactory(),
 		debugexporter.NewFactory(),
 	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create OTEL collector: %w", err)
-	}
+	require.NoError(t, err)
 
 	cfgFile, err := getCollectorCfg(cfg, esURL, t.TempDir())
-	if err != nil {
-		return nil, fmt.Errorf("failed to load collector config: %w", err)
-	}
+	require.NoError(t, err)
 	_, err = otelcoltest.LoadConfigAndValidate(cfgFile.Name(), factories)
-	if err != nil {
-		return nil, fmt.Errorf("failed to validate OTEL configuration: %w", err)
-	}
+	require.NoError(t, err)
 
 	fp := fileprovider.NewWithSettings(confmap.ProviderSettings{})
 	cfgProviderSettings := otelcol.ConfigProviderSettings{
@@ -85,13 +76,14 @@ func newTestCollector(t testing.TB, cfg config, esURL string) (*otelCol, error) 
 		},
 	}
 	collector, err := otelcol.NewCollector(collectorSettings)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create OTEL collector: %w", err)
-	}
-	return &otelCol{
+	require.NoError(t, err)
+
+	wrappedCollector := &otelCol{
 		col:      collector,
 		settings: collectorSettings,
-	}, nil
+	}
+	t.Cleanup(wrappedCollector.Shutdown)
+	return wrappedCollector
 }
 
 // Recreate recreates the collector with the same configuration. Note
