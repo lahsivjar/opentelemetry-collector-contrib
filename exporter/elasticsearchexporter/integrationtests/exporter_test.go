@@ -48,8 +48,9 @@ func runner(t *testing.T, restartCollector, mockESFailure bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	flushIvl := time.Second
 	mockES := newMockESClient(t, cfg.Debug)
-	collector := newTestCollector(t, cfg, mockES.ServerURL)
+	collector := newTestCollector(t, cfg, mockES.ServerURL, flushIvl)
 
 	var g errgroup.Group
 	cancelRun := runTestCollectorWithWait(ctx, t, collector, &g)
@@ -60,8 +61,11 @@ func runner(t *testing.T, restartCollector, mockESFailure bool) {
 			// If restartCollector is not set then recover ES service
 			// after a few failed bulk requests otherwise ensure that
 			// both collector and ES are unavailable for the same
-			// duration considering worst case scenario.
-			time.AfterFunc(10*time.Second, func() {
+			// duration considering worst case scenario. We use a
+			// multiple of flush interval to determine the downtime for
+			// ES. Using a multiple greater than 1 insures that there
+			// is enough downtime to make flush/bulk reqests to ES.
+			time.AfterFunc(10*flushIvl, func() {
 				mockES.SetReturnStatusCode(http.StatusOK)
 			})
 		}
