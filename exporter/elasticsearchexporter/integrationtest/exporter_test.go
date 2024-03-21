@@ -93,6 +93,7 @@ func runner(t *testing.T, restartCollector, mockESFailure bool) {
 		t, func() bool {
 			resp, err := mockES.Count(mockES.Count.WithIndex(cfg.ESLogsIndex))
 			require.NoError(t, err)
+			defer resp.Body.Close()
 
 			body, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
