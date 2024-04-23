@@ -16,8 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/testbed/testbed"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/exporter/exportertest"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 )
@@ -429,14 +431,60 @@ func TestExporter_PushTraceRecord(t *testing.T) {
 		assert.Equal(t, [3]int{1, 2, 1}, attempts)
 	})
 }
-func newTestLogsExporter(t *testing.T, url string, fns ...func(*Config)) *elasticsearchLogsExporter {
-	exporter, err := newLogsExporter(zaptest.NewLogger(t), withTestTracesExporterConfig(fns...)(url))
-	require.NoError(t, err)
 
-	t.Cleanup(func() {
-		require.NoError(t, exporter.Shutdown(context.TODO()))
+func BenchmarkTracesExporter(b *testing.B) {
+	for _, tc := range []struct {
+		name      string
+		batchSize int
+	}{
+		{name: "small_batch", batchSize: 10},
+		{name: "medium_batch", batchSize: 100},
+		{name: "large_batch", batchSize: 1000},
+		{name: "xlarge_batch", batchSize: 10000},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			benchmarkTraces(b, tc.batchSize)
+		})
+	}
+}
+
+func benchmarkTraces(b *testing.B, batchSize int) {
+	var observedCount, generatedCount atomic.Uint64
+	server := newESTestServer(b, func(docs []itemRequest) ([]itemResponse, error) {
+		observedCount.Add(uint64(len(docs)))
+		return itemsAllOK(docs)
 	})
-	return exporter
+
+	factory := NewFactory()
+
+	cfg := factory.CreateDefaultConfig().(*Config)
+	cfg.Endpoints = []string{server.URL}
+	cfg.Flush.Interval = 10 * time.Millisecond
+	cfg.NumWorkers = 1
+
+	exporter, err := factory.CreateTracesExporter(
+		context.Background(),
+		exportertest.NewNopCreateSettings(),
+		cfg,
+	)
+	require.NoError(b, err)
+
+	provider := testbed.NewPerfTestDataProvider(testbed.LoadOptions{ItemsPerBatch: batchSize})
+	provider.SetLoadGeneratorCounters(&generatedCount)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		traces, _ := provider.GenerateTraces()
+		b.StartTimer()
+		exporter.ConsumeTraces(ctx, traces)
+	}
+	require.NoError(b, exporter.Shutdown(ctx))
+	require.Equal(b, generatedCount.Load(), observedCount.Load(), "failed to send all traces to backend")
 }
 
 func newTestTracesExporter(t *testing.T, url string, fns ...func(*Config)) *elasticsearchTracesExporter {

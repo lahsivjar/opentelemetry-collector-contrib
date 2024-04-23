@@ -124,7 +124,7 @@ func (r *bulkRecorder) countItems() (count int) {
 	return count
 }
 
-func newESTestServer(t *testing.T, bulkHandler bulkHandler) *httptest.Server {
+func newESTestServer(t testing.TB, bulkHandler bulkHandler) *httptest.Server {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", handleErr(func(w http.ResponseWriter, _ *http.Request) error {

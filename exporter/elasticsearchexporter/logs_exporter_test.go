@@ -18,8 +18,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/exporter/exportertest"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/testbed/testbed"
 )
 
 func TestExporter_New(t *testing.T) {
@@ -161,7 +164,7 @@ func TestExporter_PushEvent(t *testing.T) {
 			return itemsAllOK(docs)
 		})
 
-		exporter := newTestExporter(t, server.URL)
+		exporter := newTestLogsExporter(t, server.URL)
 		mustSend(t, exporter, `{"message": "test1"}`)
 		mustSend(t, exporter, `{"message": "test2"}`)
 
@@ -183,7 +186,7 @@ func TestExporter_PushEvent(t *testing.T) {
 		testConfig := withTestExporterConfig(func(cfg *Config) {
 			cfg.Mapping.Mode = "ecs"
 		})(server.URL)
-		exporter := newTestExporter(t, server.URL, func(cfg *Config) { *cfg = *testConfig })
+		exporter := newTestLogsExporter(t, server.URL, func(cfg *Config) { *cfg = *testConfig })
 		mustSendLogsWithAttributes(t, exporter,
 			// record attrs
 			map[string]string{
@@ -335,7 +338,7 @@ func TestExporter_PushEvent(t *testing.T) {
 			return itemsAllOK(docs)
 		})
 
-		exporter := newTestExporter(t, server.URL)
+		exporter := newTestLogsExporter(t, server.URL)
 		mustSend(t, exporter, `{"message": "test1"}`)
 
 		rec.WaitItems(1)
@@ -383,7 +386,7 @@ func TestExporter_PushEvent(t *testing.T) {
 						server := newESTestServer(t, handler(attempts))
 
 						testConfig := configurer(server.URL)
-						exporter := newTestExporter(t, server.URL, func(cfg *Config) { *cfg = *testConfig })
+						exporter := newTestLogsExporter(t, server.URL, func(cfg *Config) { *cfg = *testConfig })
 						mustSend(t, exporter, `{"message": "test1"}`)
 
 						time.Sleep(200 * time.Millisecond)
@@ -401,7 +404,7 @@ func TestExporter_PushEvent(t *testing.T) {
 			return nil, &httpTestError{message: "oops", status: http.StatusBadRequest}
 		})
 
-		exporter := newTestExporter(t, server.URL)
+		exporter := newTestLogsExporter(t, server.URL)
 		mustSend(t, exporter, `{"message": "test1"}`)
 
 		time.Sleep(200 * time.Millisecond)
@@ -422,7 +425,7 @@ func TestExporter_PushEvent(t *testing.T) {
 			return itemsAllOK(docs)
 		})
 
-		exporter := newTestExporter(t, server.URL)
+		exporter := newTestLogsExporter(t, server.URL)
 		mustSend(t, exporter, `{"message": "test1"}`)
 
 		rec.WaitItems(1)
@@ -435,7 +438,7 @@ func TestExporter_PushEvent(t *testing.T) {
 			return itemsReportStatus(docs, http.StatusBadRequest)
 		})
 
-		exporter := newTestExporter(t, server.URL)
+		exporter := newTestLogsExporter(t, server.URL)
 		mustSend(t, exporter, `{"message": "test1"}`)
 
 		time.Sleep(200 * time.Millisecond)
@@ -471,7 +474,7 @@ func TestExporter_PushEvent(t *testing.T) {
 			return resp, nil
 		})
 
-		exporter := newTestExporter(t, server.URL, func(cfg *Config) {
+		exporter := newTestLogsExporter(t, server.URL, func(cfg *Config) {
 			cfg.Flush.Interval = 50 * time.Millisecond
 			cfg.Retry.InitialInterval = 1 * time.Millisecond
 			cfg.Retry.MaxInterval = 10 * time.Millisecond
@@ -486,8 +489,63 @@ func TestExporter_PushEvent(t *testing.T) {
 	})
 }
 
-func newTestExporter(t *testing.T, url string, fns ...func(*Config)) *elasticsearchLogsExporter {
-	exporter, err := newLogsExporter(zaptest.NewLogger(t), withTestExporterConfig(fns...)(url))
+func BenchmarkLogsExporter(b *testing.B) {
+	for _, tc := range []struct {
+		name      string
+		batchSize int
+	}{
+		{name: "small_batch", batchSize: 10},
+		{name: "medium_batch", batchSize: 100},
+		{name: "large_batch", batchSize: 1000},
+		{name: "xlarge_batch", batchSize: 10000},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			benchmarkLogs(b, tc.batchSize)
+		})
+	}
+}
+
+func benchmarkLogs(b *testing.B, batchSize int) {
+	var observedCount, generatedCount atomic.Uint64
+	server := newESTestServer(b, func(docs []itemRequest) ([]itemResponse, error) {
+		observedCount.Add(uint64(len(docs)))
+		return itemsAllOK(docs)
+	})
+
+	factory := NewFactory()
+
+	cfg := factory.CreateDefaultConfig().(*Config)
+	cfg.Endpoints = []string{server.URL}
+	cfg.Flush.Interval = 10 * time.Millisecond
+	cfg.NumWorkers = 1
+
+	exporter, err := factory.CreateLogsExporter(
+		context.Background(),
+		exportertest.NewNopCreateSettings(),
+		cfg,
+	)
+	require.NoError(b, err)
+
+	provider := testbed.NewPerfTestDataProvider(testbed.LoadOptions{ItemsPerBatch: batchSize})
+	provider.SetLoadGeneratorCounters(&generatedCount)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		logs, _ := provider.GenerateLogs()
+		b.StartTimer()
+		exporter.ConsumeLogs(ctx, logs)
+	}
+	require.NoError(b, exporter.Shutdown(ctx))
+	require.Equal(b, generatedCount.Load(), observedCount.Load(), "failed to send all logs to backend")
+}
+
+func newTestLogsExporter(t *testing.T, url string, fns ...func(*Config)) *elasticsearchLogsExporter {
+	exporter, err := newLogsExporter(zaptest.NewLogger(t), withTestTracesExporterConfig(fns...)(url))
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
