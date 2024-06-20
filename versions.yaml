@@ -168,6 +168,7 @@ module-sets:
       - github.com/open-telemetry/opentelemetry-collector-contrib/processor/groupbyattrsprocessor
       - github.com/open-telemetry/opentelemetry-collector-contrib/processor/groupbytraceprocessor
       - github.com/open-telemetry/opentelemetry-collector-contrib/processor/intervalprocessor
+      - github.com/open-telemetry/opentelemetry-collector-contrib/processor/lsmintervalprocessor
       - github.com/open-telemetry/opentelemetry-collector-contrib/processor/k8sattributesprocessor
       - github.com/open-telemetry/opentelemetry-collector-contrib/processor/logdedupprocessor
       - github.com/open-telemetry/opentelemetry-collector-contrib/processor/logstransformprocessor

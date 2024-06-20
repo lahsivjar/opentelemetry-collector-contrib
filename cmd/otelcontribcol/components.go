@@ -119,6 +119,7 @@ import (
 	intervalprocessor "github.com/open-telemetry/opentelemetry-collector-contrib/processor/intervalprocessor"
 	k8sattributesprocessor "github.com/open-telemetry/opentelemetry-collector-contrib/processor/k8sattributesprocessor"
 	logdedupprocessor "github.com/open-telemetry/opentelemetry-collector-contrib/processor/logdedupprocessor"
+	lsmintervalprocessor "github.com/open-telemetry/opentelemetry-collector-contrib/processor/lsmintervalprocessor"
 	metricsgenerationprocessor "github.com/open-telemetry/opentelemetry-collector-contrib/processor/metricsgenerationprocessor"
 	metricstransformprocessor "github.com/open-telemetry/opentelemetry-collector-contrib/processor/metricstransformprocessor"
 	probabilisticsamplerprocessor "github.com/open-telemetry/opentelemetry-collector-contrib/processor/probabilisticsamplerprocessor"
@@ -605,6 +606,7 @@ func components() (otelcol.Factories, error) {
 		groupbyattrsprocessor.NewFactory(),
 		groupbytraceprocessor.NewFactory(),
 		intervalprocessor.NewFactory(),
+		lsmintervalprocessor.NewFactory(),
 		k8sattributesprocessor.NewFactory(),
 		logdedupprocessor.NewFactory(),
 		metricsgenerationprocessor.NewFactory(),
