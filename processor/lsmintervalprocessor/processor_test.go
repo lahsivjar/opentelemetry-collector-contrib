@@ -27,6 +27,8 @@ func TestAggregation(t *testing.T) {
 	testCases := []string{
 		"sum_cumulative",
 		"sum_delta",
+		"histogram_cumulative",
+		"histogram_delta",
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

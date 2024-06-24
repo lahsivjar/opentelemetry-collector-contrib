@@ -114,7 +114,6 @@ func (v *Value) Merge(op Value) error {
 			}
 		}
 	}
-	// TODO: Iterate over the op and merge
 	return nil
 }
 
@@ -131,16 +130,24 @@ func (v *Value) MergeMetric(
 	switch m.Type() {
 	case pmetric.MetricTypeSum:
 		mClone, metricID := v.getOrCloneMetric(rm, sm, m)
-		switch m.Sum().AggregationTemporality() {
-		case pmetric.AggregationTemporalityCumulative:
-			mergeCumulativeSum(m.Sum(), mClone.Sum(), metricID, v.numberLookup)
-		case pmetric.AggregationTemporalityDelta:
-			mergeDeltaSum(m.Sum(), mClone.Sum(), metricID, v.numberLookup)
-		}
+		merge(
+			m.Sum().DataPoints(),
+			mClone.Sum().DataPoints(),
+			metricID,
+			v.numberLookup,
+			m.Sum().AggregationTemporality(),
+		)
 	case pmetric.MetricTypeHistogram:
-		// TODO: implement for parity with intervalprocessor
+		mClone, metricID := v.getOrCloneMetric(rm, sm, m)
+		merge(
+			m.Histogram().DataPoints(),
+			mClone.Histogram().DataPoints(),
+			metricID,
+			v.histoLookup,
+			m.Histogram().AggregationTemporality(),
+		)
 	case pmetric.MetricTypeExponentialHistogram:
-		// TODO: implement for parity with intervalprocessor
+		// TODO: implement
 	}
 }
 
@@ -266,59 +273,103 @@ func (v *Value) getOrCloneMetric(
 	return mClone, metricID
 }
 
-// TODO: Abstract and refactor
-func mergeDeltaSum(
-	src, dest pmetric.Sum,
+func merge[DPS DataPointSlice[DP], DP DataPoint[DP]](
+	from, to DPS,
 	mID identity.Metric,
-	lookup map[identity.Stream]pmetric.NumberDataPoint,
+	lookup map[identity.Stream]DP,
+	temporality pmetric.AggregationTemporality,
 ) {
-	srcDPS := src.DataPoints()
-	for i := 0; i < srcDPS.Len(); i++ {
-		srcDP := srcDPS.At(i)
+	switch temporality {
+	case pmetric.AggregationTemporalityCumulative:
+		mergeCumulative(from, to, mID, lookup)
+	case pmetric.AggregationTemporalityDelta:
+		mergeDelta(from, to, mID, lookup)
+	}
+}
 
-		streamID := identity.OfStream(mID, srcDP)
-		destDP, ok := lookup[streamID]
+func mergeCumulative[DPS DataPointSlice[DP], DP DataPoint[DP]](
+	from, to DPS,
+	mID identity.Metric,
+	lookup map[identity.Stream]DP,
+) {
+	for i := 0; i < from.Len(); i++ {
+		fromDP := from.At(i)
+
+		streamID := identity.OfStream(mID, fromDP)
+		toDP, ok := lookup[streamID]
 		if !ok {
-			destDP = dest.DataPoints().AppendEmpty()
-			srcDP.CopyTo(destDP)
-			lookup[streamID] = destDP
+			toDP = to.AppendEmpty()
+			fromDP.CopyTo(toDP)
+			lookup[streamID] = toDP
 			continue
 		}
 
-		switch srcDP.ValueType() {
-		case pmetric.NumberDataPointValueTypeInt:
-			destDP.SetIntValue(destDP.IntValue() + srcDP.IntValue())
-		case pmetric.NumberDataPointValueTypeDouble:
-			destDP.SetDoubleValue(destDP.DoubleValue() + srcDP.DoubleValue())
-		}
-
-		// Keep the highest timestamp for the aggregated metric
-		if srcDP.Timestamp() > destDP.Timestamp() {
-			destDP.SetTimestamp(srcDP.Timestamp())
+		if fromDP.Timestamp() > toDP.Timestamp() {
+			fromDP.CopyTo(toDP)
 		}
 	}
 }
 
-func mergeCumulativeSum(
-	src, dest pmetric.Sum,
+func mergeDelta[DPS DataPointSlice[DP], DP DataPoint[DP]](
+	from, to DPS,
 	mID identity.Metric,
-	lookup map[identity.Stream]pmetric.NumberDataPoint,
+	lookup map[identity.Stream]DP,
 ) {
-	srcDPS := src.DataPoints()
-	for i := 0; i < srcDPS.Len(); i++ {
-		srcDP := srcDPS.At(i)
+	for i := 0; i < from.Len(); i++ {
+		fromDP := from.At(i)
 
-		streamID := identity.OfStream(mID, srcDP)
-		destDP, ok := lookup[streamID]
+		streamID := identity.OfStream(mID, fromDP)
+		toDP, ok := lookup[streamID]
 		if !ok {
-			destDP = dest.DataPoints().AppendEmpty()
-			srcDP.CopyTo(destDP)
-			lookup[streamID] = destDP
+			toDP = to.AppendEmpty()
+			fromDP.CopyTo(toDP)
+			lookup[streamID] = toDP
 			continue
 		}
 
-		if srcDP.Timestamp() > destDP.Timestamp() {
-			srcDP.CopyTo(destDP)
+		switch fromDP := any(fromDP).(type) {
+		case pmetric.NumberDataPoint:
+			mergeDeltaSumDP(fromDP, any(toDP).(pmetric.NumberDataPoint))
+		case pmetric.HistogramDataPoint:
+			mergeDeltaHistogramDP(fromDP, any(toDP).(pmetric.HistogramDataPoint))
 		}
+
+		// Keep the highest timestamp for the aggregated metric
+		if fromDP.Timestamp() > toDP.Timestamp() {
+			toDP.SetTimestamp(fromDP.Timestamp())
+		}
+	}
+}
+
+func mergeDeltaSumDP(from, to pmetric.NumberDataPoint) {
+	switch from.ValueType() {
+	case pmetric.NumberDataPointValueTypeInt:
+		to.SetIntValue(to.IntValue() + from.IntValue())
+	case pmetric.NumberDataPointValueTypeDouble:
+		to.SetDoubleValue(to.DoubleValue() + from.DoubleValue())
+	}
+}
+
+func mergeDeltaHistogramDP(from, to pmetric.HistogramDataPoint) {
+	// Explicit bounds histogram should have same pre-defined buckets.
+	// However, it is possible that the boundaries got updated. In such
+	// scenarios we can't calculate the histogram for conflicting
+	// boundaries. In practical situations, we should not see such
+	// cases because if the service restarts to apply the new boundaries
+	// then some of the resource attributes will change which will change
+	// the identification for the metric, however, we still protect
+	// against the cases by checking the size of the counts slice. This
+	// way our code will not panic on such cases but it would still
+	// produce inconsistent results if the bounds have been changed.
+	// TODO: Should we make the bounds as a parameter for histogram ID?
+	// fromCounts := fromDP.BucketCounts()
+	// toCounts := toDP.BucketCounts()
+	fromCounts := from.BucketCounts()
+	toCounts := to.BucketCounts()
+	if fromCounts.Len() != toCounts.Len() {
+		return
+	}
+	for i := 0; i < toCounts.Len(); i++ {
+		toCounts.SetAt(i, fromCounts.At(i)+toCounts.At(i))
 	}
 }
