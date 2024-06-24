@@ -196,15 +196,12 @@ func (p *Processor) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) erro
 				switch t := m.Type(); t {
 				case pmetric.MetricTypeEmpty, pmetric.MetricTypeGauge, pmetric.MetricTypeSummary:
 					return false
-				case pmetric.MetricTypeHistogram:
-					// TODO implement for parity with intervalprocessor
-					return false
+				case pmetric.MetricTypeSum, pmetric.MetricTypeHistogram:
+					v.MergeMetric(rm, sm, m)
+					return true
 				case pmetric.MetricTypeExponentialHistogram:
 					// TODO implement for parity with intervalprocessor
 					return false
-				case pmetric.MetricTypeSum:
-					v.MergeMetric(rm, sm, m)
-					return true
 				default:
 					// All metric types are handled, this is unexpected
 					errs = append(errs, fmt.Errorf("unexpected metric type, dropping: %d", t))
