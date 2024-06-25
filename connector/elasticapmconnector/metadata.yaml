@@ -1,0 +1,13 @@
+type: elasticapmconnector
+scope_name: otelcol/elasticapmconnector
+
+status:
+  class: connector
+  stability:
+    development: [traces_to_metrics, metrics_to_metrics, logs_to_metrics]
+  distributions: [contrib]
+  codeowners:
+    active: []
+
+tests:
+  config:
