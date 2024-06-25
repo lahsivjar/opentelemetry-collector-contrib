@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/lsmintervalprocessor/internal/metadata"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/processor"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/lsmintervalprocessor/internal/metadata"
 )
 
 // NewFactory returns a new factory for the Metrics Generation processor.
