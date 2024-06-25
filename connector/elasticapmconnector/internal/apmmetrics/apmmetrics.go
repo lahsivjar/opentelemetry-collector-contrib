@@ -28,15 +28,9 @@ import (
 type Creator struct {
 	m pmetric.Metrics
 
-	svcSummaryDP pmetric.NumberDataPoint
-	svcTxnDPS    pmetric.HistogramDataPointSlice
-	txnDPS       pmetric.HistogramDataPointSlice
-
-	txnRes    pmetric.ResourceMetrics
-	txnMetric pmetric.Metric
-
-	svcTxnRes    pmetric.ResourceMetrics
-	svcTxnMetric pmetric.Metric
+	svcSummary pmetric.Metric
+	svcTxn     pmetric.Metric
+	txn        pmetric.Metric
 }
 
 func NewCreator() Creator {
@@ -45,8 +39,8 @@ func NewCreator() Creator {
 
 func (c *Creator) WithResource(res pcommon.Resource) {
 	svcSummaryRes := c.m.ResourceMetrics().AppendEmpty()
-	c.svcTxnRes = c.m.ResourceMetrics().AppendEmpty()
-	c.txnRes = c.m.ResourceMetrics().AppendEmpty()
+	svcTxnRes := c.m.ResourceMetrics().AppendEmpty()
+	txnRes := c.m.ResourceMetrics().AppendEmpty()
 
 	res.Attributes().Range(func(k string, v pcommon.Value) bool {
 		addTo := make([]pcommon.Map, 0, 3)
@@ -59,8 +53,8 @@ func (c *Creator) WithResource(res pcommon.Resource) {
 			addTo = append(
 				addTo,
 				svcSummaryRes.Resource().Attributes(),
-				c.svcTxnRes.Resource().Attributes(),
-				c.txnRes.Resource().Attributes(),
+				svcTxnRes.Resource().Attributes(),
+				txnRes.Resource().Attributes(),
 			)
 		case semconv.AttributeCloudProvider,
 			semconv.AttributeCloudRegion,
@@ -82,7 +76,7 @@ func (c *Creator) WithResource(res pcommon.Resource) {
 			semconv.AttributeFaaSVersion,
 			semconv.AttributeFaaSTrigger:
 
-			addTo = append(addTo, c.txnRes.Resource().Attributes())
+			addTo = append(addTo, txnRes.Resource().Attributes())
 		case semconv.AttributeContainerName,
 			semconv.AttributeContainerImageName,
 			semconv.AttributeContainerImageID, // not handled in apm-data
@@ -117,22 +111,23 @@ func (c *Creator) WithResource(res pcommon.Resource) {
 		default:
 			// All other remaining fields are converted by apm-data to global labels
 			// and these should be added to the generated metrics
-			switch v.Type() {
-			case pcommon.ValueTypeStr:
-				doForAll(addTo, func(m pcommon.Map) { m.PutStr(k, v.Str()) })
-			case pcommon.ValueTypeInt:
-				doForAll(addTo, func(m pcommon.Map) { m.PutInt(k, v.Int()) })
-			case pcommon.ValueTypeDouble:
-				doForAll(addTo, func(m pcommon.Map) { m.PutDouble(k, v.Double()) })
-			case pcommon.ValueTypeBool:
-				doForAll(addTo, func(m pcommon.Map) { m.PutBool(k, v.Bool()) })
-			case pcommon.ValueTypeMap:
-				doForAll(addTo, func(m pcommon.Map) { v.Map().CopyTo(m.PutEmptyMap(k)) })
-			case pcommon.ValueTypeSlice:
-				doForAll(addTo, func(m pcommon.Map) { v.Slice().CopyTo(m.PutEmptySlice(k)) })
-			case pcommon.ValueTypeBytes:
-				doForAll(addTo, func(m pcommon.Map) { v.Bytes().CopyTo(m.PutEmptyBytes(k)) })
-			}
+			addTo = append(addTo, svcSummaryRes.Resource().Attributes())
+		}
+		switch v.Type() {
+		case pcommon.ValueTypeStr:
+			doForAll(addTo, func(m pcommon.Map) { m.PutStr(k, v.Str()) })
+		case pcommon.ValueTypeInt:
+			doForAll(addTo, func(m pcommon.Map) { m.PutInt(k, v.Int()) })
+		case pcommon.ValueTypeDouble:
+			doForAll(addTo, func(m pcommon.Map) { m.PutDouble(k, v.Double()) })
+		case pcommon.ValueTypeBool:
+			doForAll(addTo, func(m pcommon.Map) { m.PutBool(k, v.Bool()) })
+		case pcommon.ValueTypeMap:
+			doForAll(addTo, func(m pcommon.Map) { v.Map().CopyTo(m.PutEmptyMap(k)) })
+		case pcommon.ValueTypeSlice:
+			doForAll(addTo, func(m pcommon.Map) { v.Slice().CopyTo(m.PutEmptySlice(k)) })
+		case pcommon.ValueTypeBytes:
+			doForAll(addTo, func(m pcommon.Map) { v.Bytes().CopyTo(m.PutEmptyBytes(k)) })
 		}
 		return true
 	})
@@ -140,12 +135,8 @@ func (c *Creator) WithResource(res pcommon.Resource) {
 	// We create the service summary metric and cache it. Since service summary depends only
 	// on resource attributes we can do it at this phase when we have a new resource attribute.
 	// The timestamp will be updated when we consume the signals.
-	svcSummaryMetric := svcSummaryRes.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
-	svcSummaryMetric.SetName("service_summary")
-	sum := svcSummaryMetric.SetEmptySum()
-	sum.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
-	c.svcSummaryDP = sum.DataPoints().AppendEmpty()
-	c.svcSummaryDP.SetIntValue(0)
+	c.svcSummary = svcSummaryRes.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	c.svcSummary.SetName("service_summary")
 
 	// // As per apm-data, no scope attributes are needed in the generated metrics so we create
 	// // all scopes here. In case scope attributes are required in the generated metrics then
@@ -169,6 +160,15 @@ func (c *Creator) WithScope(scope pcommon.InstrumentationScope) {
 }
 
 func (c *Creator) Metrics() pmetric.Metrics {
+	c.m.ResourceMetrics().RemoveIf(func(r pmetric.ResourceMetrics) bool {
+		r.ScopeMetrics().RemoveIf(func(s pmetric.ScopeMetrics) bool {
+			s.Metrics().RemoveIf(func(m pmetric.Metric) bool {
+				return m.Type() == pmetric.MetricTypeEmpty
+			})
+			return s.Metrics().Len() == 0
+		})
+		return r.ScopeMetrics().Len() == 0
+	})
 	return c.m
 }
 
@@ -230,8 +230,15 @@ func (c *Creator) ConsumeMetricSlice(metrics pmetric.MetricSlice) {
 
 func (c *Creator) updateServiceSummaryMetric(recordTs pcommon.Timestamp) {
 	// TODO: Should we also set start timestamp?
-	if recordTs > c.svcSummaryDP.Timestamp() {
-		c.svcSummaryDP.SetTimestamp(recordTs)
+	if c.svcSummary.Type() == pmetric.MetricTypeEmpty {
+		sum := c.svcSummary.SetEmptySum()
+		sum.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+		// Always set 0 value
+		sum.DataPoints().AppendEmpty().SetIntValue(0)
+	}
+	dp := c.svcSummary.Sum().DataPoints().At(0)
+	if recordTs > dp.Timestamp() {
+		dp.SetTimestamp(recordTs)
 	}
 }
 
@@ -272,8 +279,8 @@ func (c *Creator) addServiceTxnMetrics(
 		return true
 	})
 
-	dp := c.svcTxnDPS.AppendEmpty()
-	dp.Attributes().PutStr("transaction.type", txnType)
+	//dp := c.svcTxnDPS.AppendEmpty()
+	//dp.Attributes().PutStr("transaction.type", txnType)
 	// TODO: Create from hdr histogram boundaries
 	// dest.SetStartTimestamp(ms.StartTimestamp())
 	// dest.SetTimestamp(ms.Timestamp())
