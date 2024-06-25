@@ -76,7 +76,7 @@ func newProcessor(cfg *Config, log *zap.Logger, next consumer.Metrics) (*Process
 		wOpts:          writeOpts,
 		intervals:      cfg.Intervals,
 		next:           next,
-		processingTime: time.Now().Truncate(cfg.Intervals[0]),
+		processingTime: time.Now().UTC().Truncate(cfg.Intervals[0]),
 		ctx:            ctx,
 		cancel:         cancel,
 		logger:         log,

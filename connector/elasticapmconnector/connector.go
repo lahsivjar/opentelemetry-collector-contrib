@@ -60,7 +60,7 @@ func (c *elasticAPMConnector) ConsumeTraces(ctx context.Context, traces ptrace.T
 			creator.ConsumeSpanSlice(scopeSpan.Spans())
 		}
 	}
-	return c.ConsumeMetrics(ctx, creator.Metrics())
+	return c.metricsConsumer.ConsumeMetrics(ctx, creator.Metrics())
 }
 
 func (c *elasticAPMConnector) ConsumeLogs(ctx context.Context, logs plog.Logs) error {
@@ -78,7 +78,7 @@ func (c *elasticAPMConnector) ConsumeLogs(ctx context.Context, logs plog.Logs) e
 			creator.ConsumeLogSlice(scopeLog.LogRecords())
 		}
 	}
-	return c.ConsumeMetrics(ctx, creator.Metrics())
+	return c.metricsConsumer.ConsumeMetrics(ctx, creator.Metrics())
 }
 
 func (c *elasticAPMConnector) ConsumeMetrics(ctx context.Context, metrics pmetric.Metrics) error {
@@ -96,5 +96,5 @@ func (c *elasticAPMConnector) ConsumeMetrics(ctx context.Context, metrics pmetri
 			creator.ConsumeMetricSlice(scopeMetric.Metrics())
 		}
 	}
-	return c.ConsumeMetrics(ctx, creator.Metrics())
+	return c.metricsConsumer.ConsumeMetrics(ctx, creator.Metrics())
 }

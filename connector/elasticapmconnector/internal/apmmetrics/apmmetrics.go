@@ -145,21 +145,22 @@ func (c *Creator) WithResource(res pcommon.Resource) {
 	sum := svcSummaryMetric.SetEmptySum()
 	sum.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
 	c.svcSummaryDP = sum.DataPoints().AppendEmpty()
+	c.svcSummaryDP.SetIntValue(0)
 
-	// As per apm-data, no scope attributes are needed in the generated metrics so we create
-	// all scopes here. In case scope attributes are required in the generated metrics then
-	// this should move to `WithScope`
-	c.svcTxnMetric = c.svcTxnRes.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
-	c.svcTxnMetric.SetName("service_transaction")
-	histo := c.svcTxnMetric.SetEmptyHistogram()
-	histo.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
-	c.svcTxnDPS = histo.DataPoints()
+	// // As per apm-data, no scope attributes are needed in the generated metrics so we create
+	// // all scopes here. In case scope attributes are required in the generated metrics then
+	// // this should move to `WithScope`
+	// c.svcTxnMetric = c.svcTxnRes.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	// c.svcTxnMetric.SetName("service_transaction")
+	// histo := c.svcTxnMetric.SetEmptyHistogram()
+	// histo.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+	// c.svcTxnDPS = histo.DataPoints()
 
-	c.txnMetric = c.txnRes.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
-	c.txnMetric.SetName("transaction")
-	histo = c.txnMetric.SetEmptyHistogram()
-	histo.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
-	c.txnDPS = histo.DataPoints()
+	// c.txnMetric = c.txnRes.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	// c.txnMetric.SetName("transaction")
+	// histo = c.txnMetric.SetEmptyHistogram()
+	// histo.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+	// c.txnDPS = histo.DataPoints()
 }
 
 func (c *Creator) WithScope(scope pcommon.InstrumentationScope) {
@@ -179,7 +180,7 @@ func (c *Creator) ConsumeSpanSlice(spans ptrace.SpanSlice) {
 		root := span.ParentSpanID().IsEmpty()
 		if root || span.Kind() == ptrace.SpanKindServer || span.Kind() == ptrace.SpanKindConsumer {
 			// Means we have a transaction here
-			c.addServiceTxnMetrics(span)
+			// c.addServiceTxnMetrics(span)
 			// TODO: Add transaction metric
 			// TODO: How about dropped span stats?
 		} else {
