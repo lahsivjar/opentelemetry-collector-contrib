@@ -340,11 +340,16 @@ func (p *Processor) exportForInterval(
 
 	var errs []error
 	var exportedDPCount int
+	ivlStr := formatDuration(ivl)
 	for iter.First(); iter.Valid(); iter.Next() {
 		var v merger.Value
 		if err := v.UnmarshalProto(iter.Value()); err != nil {
 			errs = append(errs, fmt.Errorf("failed to decode binary from database: %w", err))
 			continue
+		}
+		for i := 0; i < v.Metrics.ResourceMetrics().Len(); i++ {
+			res := v.Metrics.ResourceMetrics().At(i)
+			res.Resource().Attributes().PutStr("metricset.interval", ivlStr)
 		}
 		if err := p.next.ConsumeMetrics(ctx, v.Metrics); err != nil {
 			errs = append(errs, fmt.Errorf("failed to consume the decoded value: %w", err))
@@ -359,4 +364,11 @@ func (p *Processor) exportForInterval(
 		return exportedDPCount, errors.Join(errs...)
 	}
 	return exportedDPCount, nil
+}
+
+func formatDuration(d time.Duration) string {
+	if duration := d.Minutes(); duration >= 1 {
+		return fmt.Sprintf("%.0fm", duration)
+	}
+	return fmt.Sprintf("%.0fs", d.Seconds())
 }

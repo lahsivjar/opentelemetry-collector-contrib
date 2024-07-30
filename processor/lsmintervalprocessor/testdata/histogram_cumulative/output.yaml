@@ -1,28 +1,42 @@
 resourceMetrics:
-  - schemaUrl: https://test-res-schema.com/schema
-    resource:
+  - resource:
       attributes:
         - key: asdf
           value:
             stringValue: foo
+        - key: metricset.interval
+          value:
+            stringValue: 1s
+    schemaUrl: https://test-res-schema.com/schema
     scopeMetrics:
-      - schemaUrl: https://test-scope-schema.com/schema
+      - metrics:
+          - histogram:
+              aggregationTemporality: 2
+              dataPoints:
+                - attributes:
+                    - key: aaa
+                      value:
+                        stringValue: bbb
+                  bucketCounts:
+                    - "11"
+                    - "9"
+                    - "12"
+                    - "17"
+                    - "8"
+                    - "34"
+                  explicitBounds:
+                    - 0.01
+                    - 0.1
+                    - 1
+                    - 10
+                    - 100
+                  timeUnixNano: "80"
+            name: cumulative.histogram.test
+        schemaUrl: https://test-scope-schema.com/schema
         scope:
-          name: MyTestInstrument
-          version: "1.2.3"
           attributes:
             - key: foo
               value:
                 stringValue: bar
-        metrics:
-          - name: cumulative.histogram.test
-            histogram:
-              aggregationTemporality: 2
-              dataPoints:
-                - timeUnixNano: 80
-                  explicitBounds: [0.01, 0.1, 1, 10, 100]
-                  bucketCounts: [11, 9, 12, 17, 8, 34]
-                  attributes:
-                    - key: aaa
-                      value:
-                        stringValue: bbb
+          name: MyTestInstrument
+          version: 1.2.3
