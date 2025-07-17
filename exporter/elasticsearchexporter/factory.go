@@ -24,6 +24,7 @@ import (
 	"go.opentelemetry.io/collector/exporter/xexporter"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/partitioner"
 )
 
 var defaultBatcherMinSizeItems = int64(5000)
@@ -115,7 +116,7 @@ func createLogsExporter(
 
 	qbs := exporterhelper.NewLogsQueueBatchSettings()
 	if len(cf.MetadataKeys) > 0 {
-		qbs.Partitioner = metadataKeysPartitioner{keys: cf.MetadataKeys}
+		qbs.Partitioner = partitioner.NewMetadataKeys(cf.MetadataKeys)
 	}
 
 	return exporterhelper.NewLogs(
@@ -143,7 +144,7 @@ func createMetricsExporter(
 
 	qbs := exporterhelper.NewTracesQueueBatchSettings()
 	if len(cf.MetadataKeys) > 0 {
-		qbs.Partitioner = metadataKeysPartitioner{keys: cf.MetadataKeys}
+		qbs.Partitioner = partitioner.NewMetadataKeys(cf.MetadataKeys)
 	}
 
 	return exporterhelper.NewMetrics(
@@ -170,7 +171,7 @@ func createTracesExporter(ctx context.Context,
 
 	qbs := exporterhelper.NewTracesQueueBatchSettings()
 	if len(cf.MetadataKeys) > 0 {
-		qbs.Partitioner = metadataKeysPartitioner{keys: cf.MetadataKeys}
+		qbs.Partitioner = partitioner.NewMetadataKeys(cf.MetadataKeys)
 	}
 
 	return exporterhelper.NewTraces(
@@ -202,7 +203,7 @@ func createProfilesExporter(
 
 	qbs := xexporterhelper.NewProfilesQueueBatchSettings()
 	if len(cf.MetadataKeys) > 0 {
-		qbs.Partitioner = metadataKeysPartitioner{keys: cf.MetadataKeys}
+		qbs.Partitioner = partitioner.NewMetadataKeys(cf.MetadataKeys)
 	}
 
 	return xexporterhelper.NewProfiles(
