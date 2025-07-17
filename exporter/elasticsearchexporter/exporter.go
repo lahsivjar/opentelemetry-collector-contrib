@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/collector/client"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -25,6 +26,7 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/elasticsearch"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metadata"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metricgroup"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/partitioner"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/pool"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/serializer/otelserializer"
 )
@@ -96,6 +98,10 @@ func (e *elasticsearchExporter) Shutdown(ctx context.Context) error {
 }
 
 func (e *elasticsearchExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
+	ctx, err := addClientMetadataFromPartitionKey(ctx)
+	if err != nil {
+		e.set.Logger.Warn("failed to get client metadata from partition key", zap.Error(err))
+	}
 	defaultMappingMode, err := e.getRequestMappingMode(ctx)
 	if err != nil {
 		return err
@@ -192,6 +198,10 @@ func (p *dataPointsGroup) addDataPoint(dp datapoints.DataPoint) {
 }
 
 func (e *elasticsearchExporter) pushMetricsData(ctx context.Context, metrics pmetric.Metrics) error {
+	ctx, err := addClientMetadataFromPartitionKey(ctx)
+	if err != nil {
+		e.set.Logger.Warn("failed to get client metadata from partition key", zap.Error(err))
+	}
 	defaultMappingMode, err := e.getRequestMappingMode(ctx)
 	if err != nil {
 		return err
@@ -367,8 +377,10 @@ func (e *elasticsearchExporter) pushTraceData(
 	ctx context.Context,
 	td ptrace.Traces,
 ) error {
-	// Get the partioner key from the context
-	// Decode the key to get the info
+	ctx, err := addClientMetadataFromPartitionKey(ctx)
+	if err != nil {
+		e.set.Logger.Warn("failed to get client metadata from partition key", zap.Error(err))
+	}
 	defaultMappingMode, err := e.getRequestMappingMode(ctx)
 	if err != nil {
 		return err
@@ -499,6 +511,10 @@ func (e *elasticsearchExporter) extractDocumentPipelineAttribute(m pcommon.Map) 
 }
 
 func (e *elasticsearchExporter) pushProfilesData(ctx context.Context, pd pprofile.Profiles) error {
+	ctx, err := addClientMetadataFromPartitionKey(ctx)
+	if err != nil {
+		e.set.Logger.Warn("failed to get client metadata from partition key", zap.Error(err))
+	}
 	// TODO add support for routing profiles to different data_stream.namespaces?
 	defaultMappingMode, err := e.getRequestMappingMode(ctx)
 	if err != nil {
@@ -693,4 +709,12 @@ func newDataPointHasher(mode MappingMode) metricgroup.DataPointHasher {
 		// Defaults to ECS for backward compatibility
 		return &metricgroup.ECSDataPointHasher{}
 	}
+}
+
+func addClientMetadataFromPartitionKey(ctx context.Context) (context.Context, error) {
+	m, err := partitioner.UnmarshalPartitionKey(exporterhelper.PartitionKeyFromContext(ctx))
+	if err != nil {
+		return ctx, err
+	}
+	return client.NewContext(ctx, client.Info{Metadata: client.NewMetadata(m)}), nil
 }

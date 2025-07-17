@@ -135,3 +135,11 @@ replace github.com/open-telemetry/opentelemetry-collector-contrib/pkg/pdatautil 
 replace github.com/open-telemetry/opentelemetry-collector-contrib/pkg/pdatatest => ../../pkg/pdatatest
 
 replace github.com/open-telemetry/opentelemetry-collector-contrib/pkg/golden => ../../pkg/golden
+
+replace go.opentelemetry.io/collector/exporter => github.com/lahsivjar/opentelemetry-collector/exporter v0.0.0-20250717115031-3ef3eb87af81
+
+replace go.opentelemetry.io/collector/exporter/exporterhelper/xexporterhelper => github.com/lahsivjar/opentelemetry-collector/exporter/exporterhelper/xexporterhelper v0.0.0-20250717115031-3ef3eb87af81
+
+replace go.opentelemetry.io/collector/exporter/exportertest => github.com/lahsivjar/opentelemetry-collector/exporter/exportertest v0.0.0-20250717115031-3ef3eb87af81
+
+replace go.opentelemetry.io/collector/exporter/xexporter => github.com/lahsivjar/opentelemetry-collector/exporter/xexporter v0.0.0-20250717115031-3ef3eb87af81
