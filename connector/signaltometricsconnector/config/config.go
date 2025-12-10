@@ -180,7 +180,8 @@ type ExponentialHistogram struct {
 }
 
 type Sum struct {
-	Value string `mapstructure:"value"`
+	Value     string `mapstructure:"value"`
+	Monotonic bool   `mapstructure:"monotonic"`
 	// prevent unkeyed literal initialization
 	_ struct{}
 }

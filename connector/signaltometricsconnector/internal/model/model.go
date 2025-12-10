@@ -87,7 +87,8 @@ func (h *ExponentialHistogram[K]) fromConfig(
 }
 
 type Sum[K any] struct {
-	Value *ottl.ValueExpression[K]
+	Value     *ottl.ValueExpression[K]
+	Monotonic bool
 }
 
 func (s *Sum[K]) fromConfig(
@@ -103,6 +104,7 @@ func (s *Sum[K]) fromConfig(
 	if err != nil {
 		return fmt.Errorf("failed to parse value OTTL expression for sum: %w", err)
 	}
+	s.Monotonic = mi.Monotonic
 	return nil
 }
 
