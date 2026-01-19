@@ -9,6 +9,7 @@ status:
     active: [ChrsMark, lahsivjar]
 
 tests:
+  host: "newCustomHost()"
   config:
     spans:
       - name: span.duration.histogram
