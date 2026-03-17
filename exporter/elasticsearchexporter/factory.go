@@ -108,18 +108,18 @@ func createLogsExporter(
 		return nil, err
 	}
 
-	qbs := xexporterhelper.NewLogsQueueBatchSettings()
+	qbs := xexporterhelper.QueueBatchSettings{}
 	if len(cf.MetadataKeys) > 0 {
 		partitioner := metadataKeysPartitioner{keys: cf.MetadataKeys}
 		qbs.Partitioner = partitioner
 		qbs.MergeCtx = partitioner.MergeCtx
 	}
 
-	return exporterhelper.NewLogs(
+	return xexporterhelper.NewLogsRequest(
 		ctx,
 		set,
-		cfg,
-		exporter.pushLogsData,
+		exporter.convertLogsRequest,
+		exporter.pushRequest,
 		exporterhelperOptions(cf, exporter.Start, exporter.Shutdown, qbs)...,
 	)
 }
@@ -138,18 +138,18 @@ func createMetricsExporter(
 		return nil, err
 	}
 
-	qbs := xexporterhelper.NewMetricsQueueBatchSettings()
+	qbs := xexporterhelper.QueueBatchSettings{}
 	if len(cf.MetadataKeys) > 0 {
 		partitioner := metadataKeysPartitioner{keys: cf.MetadataKeys}
 		qbs.Partitioner = partitioner
 		qbs.MergeCtx = partitioner.MergeCtx
 	}
 
-	return exporterhelper.NewMetrics(
+	return xexporterhelper.NewMetricsRequest(
 		ctx,
 		set,
-		cfg,
-		exporter.pushMetricsData,
+		exporter.convertMetricsRequest,
+		exporter.pushRequest,
 		exporterhelperOptions(cf, exporter.Start, exporter.Shutdown, qbs)...,
 	)
 }
@@ -167,18 +167,18 @@ func createTracesExporter(ctx context.Context,
 		return nil, err
 	}
 
-	qbs := xexporterhelper.NewTracesQueueBatchSettings()
+	qbs := xexporterhelper.QueueBatchSettings{}
 	if len(cf.MetadataKeys) > 0 {
 		partitioner := metadataKeysPartitioner{keys: cf.MetadataKeys}
 		qbs.Partitioner = partitioner
 		qbs.MergeCtx = partitioner.MergeCtx
 	}
 
-	return exporterhelper.NewTraces(
+	return xexporterhelper.NewTracesRequest(
 		ctx,
 		set,
-		cfg,
-		exporter.pushTraceData,
+		exporter.convertTracesRequest,
+		exporter.pushRequest,
 		exporterhelperOptions(cf, exporter.Start, exporter.Shutdown, qbs)...,
 	)
 }

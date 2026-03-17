@@ -21,7 +21,6 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/configcompression"
 	"go.opentelemetry.io/collector/exporter"
-	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	conventions "go.opentelemetry.io/otel/semconv/v1.38.0"
@@ -55,6 +54,11 @@ type bulkIndexerSession interface {
 
 	// Flush flushes any documents added to the bulk indexing session.
 	Flush(context.Context) error
+
+	// setBuffer replaces the session's internal buffer with bib. This is used
+	// by pushRequest to load a pre-encoded bulkIndexerBuffer directly into the
+	// session without re-encoding, then Flush sends it in a single bulk call.
+	setBuffer(bib *bulkIndexerBuffer)
 }
 
 const defaultMaxRetries = 2
@@ -145,16 +149,8 @@ func newSyncBulkIndexer(
 	logger *zap.Logger,
 	getErrorHintFunc func(index, errorType string) string,
 ) *syncBulkIndexer {
-	var maxFlushBytes int64
-	if config.QueueBatchConfig.HasValue() && config.QueueBatchConfig.Get().Batch.HasValue() {
-		batch := config.QueueBatchConfig.Get().Batch.Get()
-		if batch.Sizer == exporterhelper.RequestSizerTypeBytes {
-			maxFlushBytes = batch.MaxSize
-		}
-	}
 	return &syncBulkIndexer{
 		config:                bulkIndexerConfig(client, config, false, logger),
-		maxFlushBytes:         maxFlushBytes,
 		flushTimeout:          config.Timeout,
 		retryConfig:           config.Retry,
 		metadataKeys:          config.MetadataKeys,
@@ -168,7 +164,6 @@ func newSyncBulkIndexer(
 
 type syncBulkIndexer struct {
 	config                docappender.BulkIndexerConfig
-	maxFlushBytes         int64
 	flushTimeout          time.Duration
 	retryConfig           RetrySettings
 	metadataKeys          []string
@@ -179,18 +174,14 @@ type syncBulkIndexer struct {
 	requireDataStream     bool
 }
 
-// StartSession creates a new docappender.BulkIndexer, and wraps
-// it with a syncBulkIndexerSession.
+// StartSession creates a new syncBulkIndexerSession backed by a pre-allocated
+// bulkIndexerBuffer. Documents are accumulated in the buffer and sent to
+// Elasticsearch as a single bulk request on Flush.
 func (s *syncBulkIndexer) StartSession(context.Context) bulkIndexerSession {
-	bi, err := docappender.NewBulkIndexer(s.config)
-	if err != nil {
-		// This should never happen in practice:
-		// NewBulkIndexer should only fail if the
-		// config is invalid, and we expect it to
-		// always be valid at this point.
-		return errBulkIndexerSession{err: err}
+	return &syncBulkIndexerSession{
+		s:   s,
+		bib: newBulkIndexerBuffer(256, 512),
 	}
-	return &syncBulkIndexerSession{s: s, bi: bi}
 }
 
 // Close is a no-op.
@@ -199,13 +190,13 @@ func (*syncBulkIndexer) Close(context.Context) error {
 }
 
 type syncBulkIndexerSession struct {
-	s  *syncBulkIndexer
-	bi *docappender.BulkIndexer
+	s   *syncBulkIndexer
+	bib *bulkIndexerBuffer
 }
 
-// Add adds an item to the sync bulk indexer session.
+// Add encodes the item into the session's bulk indexer buffer.
 func (s *syncBulkIndexerSession) Add(ctx context.Context, index, docID, pipeline string, document io.WriterTo, dynamicTemplates map[string]string, action string) error {
-	doc := docappender.BulkIndexerItem{
+	if err := s.bib.Add(docappender.BulkIndexerItem{
 		Index:             index,
 		Body:              document,
 		DocumentID:        docID,
@@ -213,9 +204,7 @@ func (s *syncBulkIndexerSession) Add(ctx context.Context, index, docID, pipeline
 		Action:            action,
 		Pipeline:          pipeline,
 		RequireDataStream: s.s.requireDataStream,
-	}
-	err := s.bi.Add(doc)
-	if err != nil {
+	}); err != nil {
 		return err
 	}
 	s.s.telemetryBuilder.ElasticsearchDocsReceived.Add(
@@ -224,27 +213,31 @@ func (s *syncBulkIndexerSession) Add(ctx context.Context, index, docID, pipeline
 			getAttributesFromMetadataKeys(ctx, s.s.metadataKeys)...),
 		),
 	)
-	// sending_queue operates on flush sizes based on pdata model whereas bulk
-	// indexers operate on ndjson. Force a flush if the ndjson size is too large.
-	// when the uncompressed length exceeds the configured max flush size.
-	if s.s.maxFlushBytes > 0 && int64(s.bi.UncompressedLen()) >= s.s.maxFlushBytes {
-		return s.Flush(ctx)
-	}
 	return nil
 }
 
 // End is a no-op.
-func (*syncBulkIndexerSession) End() {
-	// TODO acquire docappender.BulkIndexer from pool in StartSession, release here
+func (*syncBulkIndexerSession) End() {}
+
+func (s *syncBulkIndexerSession) setBuffer(bib *bulkIndexerBuffer) {
+	s.bib = bib
 }
 
-// Flush flushes documents added to the bulk indexer session.
+// Flush creates a fresh BulkIndexer, loads the accumulated buffer, and
+// flushes it to Elasticsearch with per-document retry support.
 func (s *syncBulkIndexerSession) Flush(ctx context.Context) error {
+	bi, err := docappender.NewBulkIndexer(s.s.config)
+	if err != nil {
+		return err
+	}
+	if err := bi.AddBuffer(s.bib); err != nil {
+		return err
+	}
 	var retryBackoff func(int) time.Duration
 	for attempts := 0; ; attempts++ {
 		if err := flushBulkIndexer(
 			ctx,
-			s.bi,
+			bi,
 			s.s.flushTimeout,
 			s.s.metadataKeys,
 			s.s.telemetryBuilder,
@@ -254,7 +247,7 @@ func (s *syncBulkIndexerSession) Flush(ctx context.Context) error {
 		); err != nil {
 			return err
 		}
-		if s.bi.Items() == 0 {
+		if bi.Items() == 0 {
 			// No documents in buffer waiting for per-document retry, exit retry loop.
 			return nil
 		}
@@ -510,12 +503,11 @@ type bulkIndexers struct {
 	// wg tracks active sessions
 	wg sync.WaitGroup
 
-	// NOTE(axw) we have removed async bulk indexer and there should be
-	// no reason for having one per mode or for different document types.
-	// Instead, the caller can create separate sessions as needed, and we
-	// can either have one for required_data_stream=true and one for false,
-	// or callers can set this per document.
+	// shared is used by the converter+pusher path for logs, metrics, and traces.
+	// require_data_stream is handled per-item via BulkIndexerItem.RequireDataStream.
+	shared bulkIndexer
 
+	// modes is used by the profiling push path, which requires per-mode indexers.
 	modes                [NumMappingModes]bulkIndexer
 	profilingEvents      bulkIndexer // For profiling-events-*
 	profilingStackTraces bulkIndexer // For profiling-stacktraces
@@ -545,6 +537,9 @@ func (b *bulkIndexers) start(
 		return err
 	}
 
+	sharedBI := newBulkIndexer(esClient, cfg, false /*requireDataStream*/, b.telemetryBuilder, set.Logger, getErrorHintForShared)
+	b.shared = &wgTrackingBulkIndexer{bulkIndexer: sharedBI, wg: &b.wg}
+
 	for _, mode := range allowedMappingModes {
 		requireDataStream := mode == MappingOTel || mode == MappingECS
 		modeSpecificErrorHintFunc := func(index, errorType string) string {
@@ -573,6 +568,11 @@ func (b *bulkIndexers) start(
 }
 
 func (b *bulkIndexers) shutdown(ctx context.Context) error {
+	if b.shared != nil {
+		if err := b.shared.Close(ctx); err != nil {
+			return err
+		}
+	}
 	for _, bi := range b.modes {
 		if bi == nil {
 			continue
@@ -648,6 +648,24 @@ func (errBulkIndexerSession) End() {}
 
 func (s errBulkIndexerSession) Flush(context.Context) error {
 	return fmt.Errorf("creating bulk indexer session failed, cannot flush: %w", s.err)
+}
+
+func (errBulkIndexerSession) setBuffer(*bulkIndexerBuffer) {}
+
+// getErrorHintForShared provides error hints for the shared bulk indexer used
+// by the converter+pusher path where documents from multiple mapping modes may
+// be mixed in a single request.
+func getErrorHintForShared(index, errorType string) string {
+	// version_conflict for metrics indices is mode-independent.
+	if h := getErrorHint(MappingNone, index, errorType); h != "" {
+		return h
+	}
+	// illegal_argument_exception is produced by both OTel and ECS modes when
+	// require_data_stream is set but the ES version is too old (<8.12).
+	if errorType == "illegal_argument_exception" {
+		return errorHintOTelMappingMode
+	}
+	return ""
 }
 
 func withOutcome(outcome string) attribute.KeyValue {

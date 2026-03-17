@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/xexporterhelper"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -461,6 +462,347 @@ func (e *elasticsearchExporter) pushSpanEvent(
 	}
 	// not recycling after Add returns an error as we don't know if it's already recycled
 	return bulkIndexerSession.Add(ctx, index.Index, docID, "", buf, nil, docappender.ActionCreate)
+}
+
+func (e *elasticsearchExporter) convertLogsRequest(ctx context.Context, ld plog.Logs) (xexporterhelper.Request, error) {
+	defaultMappingMode, err := e.getRequestMappingMode(ctx)
+	if err != nil {
+		// Unwrap consumererror.Permanent: the converter framework always re-wraps
+		// converter errors in consumererror.NewPermanent, so we must not double-wrap.
+		return nil, errors.Unwrap(err)
+	}
+	bib := newBulkIndexerBuffer(ld.LogRecordCount(), 512)
+	var errs []error
+	for _, rl := range ld.ResourceLogs().All() {
+		resource := rl.Resource()
+		for _, ill := range rl.ScopeLogs().All() {
+			scope := ill.Scope()
+			mappingMode, err := e.getScopeMappingMode(scope, defaultMappingMode)
+			if err != nil {
+				return nil, errors.Unwrap(err)
+			}
+			router := e.documentRouters[int(mappingMode)]
+			encoder := e.documentEncoders[int(mappingMode)]
+			requireDataStream := mappingMode == MappingOTel || mappingMode == MappingECS
+			ec := encodingContext{
+				resource:          resource,
+				resourceSchemaURL: rl.SchemaUrl(),
+				scope:             scope,
+				scopeSchemaURL:    ill.SchemaUrl(),
+			}
+			for _, lr := range ill.LogRecords().All() {
+				if err := e.addLogRecord(router, encoder, ec, lr, requireDataStream, bib); err != nil {
+					if cerr := ctx.Err(); cerr != nil {
+						return nil, cerr
+					}
+					if errors.Is(err, ErrInvalidTypeForBodyMapMode) {
+						e.set.Logger.Warn("dropping log record", zap.Error(err))
+						continue
+					}
+					errs = append(errs, err)
+				}
+			}
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	return &bulkIndexerRequest{buf: bib}, nil
+}
+
+func (e *elasticsearchExporter) addLogRecord(
+	router documentRouter,
+	encoder documentEncoder,
+	ec encodingContext,
+	record plog.LogRecord,
+	requireDataStream bool,
+	bib *bulkIndexerBuffer,
+) error {
+	index, err := router.routeLogRecord(ec.resource, ec.scope, record.Attributes())
+	if err != nil {
+		return err
+	}
+	buf := e.bufferPool.NewPooledBuffer()
+	var docID string
+	if e.config.LogsDynamicID.Enabled {
+		docID = extractDocumentIDAttribute(record.Attributes())
+	}
+	pipeline := e.extractDocumentPipelineAttribute(record.Attributes())
+	if err := encoder.encodeLog(ec, record, index, buf.Buffer); err != nil {
+		buf.Recycle()
+		return fmt.Errorf("failed to encode log event: %w", err)
+	}
+	return bib.Add(docappender.BulkIndexerItem{
+		Index:             index.Index,
+		DocumentID:        docID,
+		Pipeline:          pipeline,
+		Body:              buf,
+		Action:            docappender.ActionCreate,
+		RequireDataStream: requireDataStream,
+	})
+}
+
+func (e *elasticsearchExporter) convertMetricsRequest(ctx context.Context, metrics pmetric.Metrics) (xexporterhelper.Request, error) {
+	defaultMappingMode, err := e.getRequestMappingMode(ctx)
+	if err != nil {
+		return nil, errors.Unwrap(err)
+	}
+	bib := newBulkIndexerBuffer(metrics.DataPointCount(), 512)
+
+	type mappingIndexKey struct {
+		mappingMode MappingMode
+		index       elasticsearch.Index
+	}
+	groupedDataPointsByIndex := make(map[mappingIndexKey]map[metricgroup.HashKey]*dataPointsGroup)
+
+	var validationErrs []error
+	var errs []error
+	for _, resourceMetrics := range metrics.ResourceMetrics().All() {
+		resource := resourceMetrics.Resource()
+		var hasher metricgroup.DataPointHasher
+		var prevScopeMappingMode MappingMode
+		for _, scopeMetrics := range resourceMetrics.ScopeMetrics().All() {
+			scope := scopeMetrics.Scope()
+			mappingMode, err := e.getScopeMappingMode(scope, defaultMappingMode)
+			if err != nil {
+				return nil, errors.Unwrap(err)
+			}
+			router := e.documentRouters[int(mappingMode)]
+			if hasher == nil || mappingMode != prevScopeMappingMode {
+				hasher = newDataPointHasher(mappingMode)
+				hasher.UpdateResource(resource)
+			}
+			prevScopeMappingMode = mappingMode
+			hasher.UpdateScope(scope)
+			for _, metric := range scopeMetrics.Metrics().All() {
+				upsertDataPoint := func(dp datapoints.DataPoint) error {
+					index, err := router.routeDataPoint(resource, scope, dp.Attributes())
+					if err != nil {
+						return err
+					}
+					key := mappingIndexKey{mappingMode: mappingMode, index: index}
+					groupedDataPoints, ok := groupedDataPointsByIndex[key]
+					if !ok {
+						groupedDataPoints = make(map[metricgroup.HashKey]*dataPointsGroup)
+						groupedDataPointsByIndex[key] = groupedDataPoints
+					}
+					hasher.UpdateDataPoint(dp)
+					hashKey := hasher.HashKey()
+					if dpGroup, ok := groupedDataPoints[hashKey]; !ok {
+						groupedDataPoints[hashKey] = &dataPointsGroup{
+							resource:          resource,
+							resourceSchemaURL: resourceMetrics.SchemaUrl(),
+							scope:             scope,
+							scopeSchemaURL:    scopeMetrics.SchemaUrl(),
+							dataPoints:        []datapoints.DataPoint{dp},
+						}
+					} else {
+						dpGroup.addDataPoint(dp)
+					}
+					return nil
+				}
+				switch metric.Type() {
+				case pmetric.MetricTypeSum:
+					for _, dp := range metric.Sum().DataPoints().All() {
+						if err := upsertDataPoint(datapoints.NewNumber(metric, dp)); err != nil {
+							validationErrs = append(validationErrs, err)
+						}
+					}
+				case pmetric.MetricTypeGauge:
+					for _, dp := range metric.Gauge().DataPoints().All() {
+						if err := upsertDataPoint(datapoints.NewNumber(metric, dp)); err != nil {
+							validationErrs = append(validationErrs, err)
+						}
+					}
+				case pmetric.MetricTypeExponentialHistogram:
+					if metric.ExponentialHistogram().AggregationTemporality() == pmetric.AggregationTemporalityCumulative {
+						validationErrs = append(validationErrs, fmt.Errorf("dropping cumulative temporality exponential histogram %q", metric.Name()))
+						continue
+					}
+					for _, dp := range metric.ExponentialHistogram().DataPoints().All() {
+						if err := upsertDataPoint(datapoints.NewExponentialHistogram(metric, dp)); err != nil {
+							validationErrs = append(validationErrs, err)
+						}
+					}
+				case pmetric.MetricTypeHistogram:
+					if metric.Histogram().AggregationTemporality() == pmetric.AggregationTemporalityCumulative {
+						validationErrs = append(validationErrs, fmt.Errorf("dropping cumulative temporality histogram %q", metric.Name()))
+						continue
+					}
+					for _, dp := range metric.Histogram().DataPoints().All() {
+						if err := upsertDataPoint(datapoints.NewHistogram(metric, dp)); err != nil {
+							validationErrs = append(validationErrs, err)
+						}
+					}
+				case pmetric.MetricTypeSummary:
+					for _, dp := range metric.Summary().DataPoints().All() {
+						if err := upsertDataPoint(datapoints.NewSummary(metric, dp)); err != nil {
+							validationErrs = append(validationErrs, err)
+						}
+					}
+				}
+			}
+		}
+	}
+	if len(validationErrs) > 0 {
+		e.set.Logger.Warn("validation errors", zap.Error(errors.Join(validationErrs...)))
+	}
+
+	for key, groupedDataPoints := range groupedDataPointsByIndex {
+		requireDataStream := key.mappingMode == MappingOTel || key.mappingMode == MappingECS
+		encoder := e.documentEncoders[int(key.mappingMode)]
+		for _, dpGroup := range groupedDataPoints {
+			buf := e.bufferPool.NewPooledBuffer()
+			dynamicTemplates, err := encoder.encodeMetrics(
+				encodingContext{
+					resource:          dpGroup.resource,
+					resourceSchemaURL: dpGroup.resourceSchemaURL,
+					scope:             dpGroup.scope,
+					scopeSchemaURL:    dpGroup.scopeSchemaURL,
+				},
+				dpGroup.dataPoints,
+				&validationErrs,
+				key.index,
+				buf.Buffer,
+			)
+			if err != nil {
+				buf.Recycle()
+				errs = append(errs, err)
+				continue
+			}
+			if err := bib.Add(docappender.BulkIndexerItem{
+				Index:             key.index.Index,
+				Body:              buf,
+				DynamicTemplates:  dynamicTemplates,
+				Action:            docappender.ActionCreate,
+				RequireDataStream: requireDataStream,
+			}); err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return nil, cerr
+				}
+				errs = append(errs, err)
+			}
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	return &bulkIndexerRequest{buf: bib}, nil
+}
+
+func (e *elasticsearchExporter) convertTracesRequest(ctx context.Context, td ptrace.Traces) (xexporterhelper.Request, error) {
+	defaultMappingMode, err := e.getRequestMappingMode(ctx)
+	if err != nil {
+		return nil, errors.Unwrap(err)
+	}
+	bib := newBulkIndexerBuffer(td.SpanCount(), 512)
+	var errs []error
+	for _, il := range td.ResourceSpans().All() {
+		resource := il.Resource()
+		for _, scopeSpan := range il.ScopeSpans().All() {
+			scope := scopeSpan.Scope()
+			mappingMode, err := e.getScopeMappingMode(scope, defaultMappingMode)
+			if err != nil {
+				return nil, errors.Unwrap(err)
+			}
+			requireDataStream := mappingMode == MappingOTel || mappingMode == MappingECS
+			router := e.documentRouters[int(mappingMode)]
+			spanEventRouter := e.spanEventDocumentRouters[int(mappingMode)]
+			encoder := e.documentEncoders[int(mappingMode)]
+			ec := encodingContext{
+				resource:          resource,
+				resourceSchemaURL: il.SchemaUrl(),
+				scope:             scope,
+				scopeSchemaURL:    scopeSpan.SchemaUrl(),
+			}
+			for _, span := range scopeSpan.Spans().All() {
+				if err := e.addTraceRecord(router, encoder, ec, span, requireDataStream, bib); err != nil {
+					if cerr := ctx.Err(); cerr != nil {
+						return nil, cerr
+					}
+					errs = append(errs, err)
+				}
+				for _, spanEvent := range span.Events().All() {
+					if err := e.addSpanEvent(spanEventRouter, encoder, ec, span, spanEvent, requireDataStream, bib); err != nil {
+						errs = append(errs, err)
+					}
+				}
+			}
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	return &bulkIndexerRequest{buf: bib}, nil
+}
+
+func (e *elasticsearchExporter) addTraceRecord(
+	router documentRouter,
+	encoder documentEncoder,
+	ec encodingContext,
+	span ptrace.Span,
+	requireDataStream bool,
+	bib *bulkIndexerBuffer,
+) error {
+	index, err := router.routeSpan(ec.resource, ec.scope, span.Attributes())
+	if err != nil {
+		return err
+	}
+	buf := e.bufferPool.NewPooledBuffer()
+	var docID string
+	if e.config.TracesDynamicID.Enabled {
+		docID = extractDocumentIDAttribute(span.Attributes())
+	}
+	if err := encoder.encodeSpan(ec, span, index, buf.Buffer); err != nil {
+		buf.Recycle()
+		return fmt.Errorf("failed to encode trace record: %w", err)
+	}
+	return bib.Add(docappender.BulkIndexerItem{
+		Index:             index.Index,
+		DocumentID:        docID,
+		Body:              buf,
+		Action:            docappender.ActionCreate,
+		RequireDataStream: requireDataStream,
+	})
+}
+
+func (e *elasticsearchExporter) addSpanEvent(
+	router documentRouter,
+	encoder documentEncoder,
+	ec encodingContext,
+	span ptrace.Span,
+	spanEvent ptrace.SpanEvent,
+	requireDataStream bool,
+	bib *bulkIndexerBuffer,
+) error {
+	index, err := router.routeSpanEvent(ec.resource, ec.scope, spanEvent.Attributes())
+	if err != nil {
+		return err
+	}
+	buf := e.bufferPool.NewPooledBuffer()
+	var docID string
+	if e.config.TracesDynamicID.Enabled {
+		docID = extractDocumentIDAttribute(spanEvent.Attributes())
+	}
+	if err := encoder.encodeSpanEvent(ec, span, spanEvent, index, buf.Buffer); err != nil || buf.Buffer.Len() == 0 {
+		buf.Recycle()
+		return err
+	}
+	return bib.Add(docappender.BulkIndexerItem{
+		Index:             index.Index,
+		DocumentID:        docID,
+		Body:              buf,
+		Action:            docappender.ActionCreate,
+		RequireDataStream: requireDataStream,
+	})
+}
+
+func (e *elasticsearchExporter) pushRequest(ctx context.Context, req xexporterhelper.Request) error {
+	bibReq := req.(*bulkIndexerRequest)
+	session := e.bulkIndexers.shared.StartSession(ctx)
+	session.setBuffer(bibReq.buf)
+	defer session.End()
+	return session.Flush(ctx)
 }
 
 // extractDocumentIDAttribute extracts the document ID from the given attributes map.
