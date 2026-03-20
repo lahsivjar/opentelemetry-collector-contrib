@@ -3,58 +3,197 @@
 
 package elasticsearchexporter
 
-// Benchmarks comparing two log-encoding strategies.
-//
-// "legacy" (current production path):
-//
-//	plog.LogRecord
-//	  → pooled *bytes.Buffer   (sync.Pool get/put)
-//	  → PooledBuffer.WriteTo
-//	  → docappender.BulkIndexer.Add
-//	       writes through countWriter into its internal bytes.Buffer
-//
-// "buffer" (new path using bulkIndexerBuffer):
-//
-//	plog.LogRecord
-//	  → pooled *bytes.Buffer   (sync.Pool get/put)
-//	  → PooledBuffer.WriteTo
-//	  → bulkIndexerBuffer.Add
-//	       writes through appendWriter directly into the flat []byte
-//
-// The buffer path removes the countWriter indirection layer, cuts per-item
-// allocations from 2 → 1, and provides zero-copy Split / O(1)-alloc Merge
-// for the queue batch sender.
-//
-// Run with:
-//
-//	go test -run='^$' -bench='BenchmarkEncodeLog|BenchmarkBulkRequest' \
-//	        -benchmem -benchtime=3s ./exporter/elasticsearchexporter/
-
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
-	"strings"
+	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/elastic/elastic-transport-go/v8/elastictransport"
-	docappender "github.com/elastic/go-docappender/v2"
-	"go.opentelemetry.io/collector/component"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/collector/exporter/xexporter"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pprofile"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/elasticsearch"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metadata"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/pool"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/pdatatest/pprofiletest"
 )
 
-const benchBatchSize = 100
+// BenchmarkExportLogs measures the end-to-end encoding + flush path for logs.
+//
+// The benchmark creates a real exporter via the factory with queue/batch
+// disabled so ConsumeLogs runs synchronously. A fast mock HTTP server
+// accepts bulk requests without parsing, isolating encoding cost.
+func BenchmarkExportLogs(b *testing.B) {
+	for _, n := range []int{1, 10, 100, 1000} {
+		b.Run(fmt.Sprintf("batch_%d", n), func(b *testing.B) {
+			server := newBenchESServer(b)
+			exp := newBenchLogsExporter(b, server.URL)
 
-// makeBenchLogs returns a plog.Logs batch with n records carrying realistic
-// attribute values (trace ID, HTTP method/status, service name, etc.).
+			logs := makeBenchLogs(n)
+			ctx := context.Background()
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if err := exp.ConsumeLogs(ctx, logs); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkExportMetrics measures the end-to-end encoding + flush path for metrics.
+//
+// The benchmark creates a real exporter via the factory with queue/batch
+// disabled so ConsumeLogs runs synchronously. A fast mock HTTP server
+// accepts bulk requests without parsing, isolating encoding cost.
+func BenchmarkExportMetrics(b *testing.B) {
+	for _, n := range []int{1, 10, 100, 1000} {
+		b.Run(fmt.Sprintf("batch_%d", n), func(b *testing.B) {
+			server := newBenchESServer(b)
+			exp := newBenchMetricsExporter(b, server.URL)
+
+			metrics := makeBenchMetrics(n)
+			ctx := context.Background()
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if err := exp.ConsumeMetrics(ctx, metrics); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkExportTraces measures the end-to-end encoding + flush path for traces.
+//
+// The benchmark creates a real exporter via the factory with queue/batch
+// disabled so ConsumeLogs runs synchronously. A fast mock HTTP server
+// accepts bulk requests without parsing, isolating encoding cost.
+func BenchmarkExportTraces(b *testing.B) {
+	for _, n := range []int{1, 10, 100, 1000} {
+		b.Run(fmt.Sprintf("batch_%d", n), func(b *testing.B) {
+			server := newBenchESServer(b)
+			exp := newBenchTracesExporter(b, server.URL)
+
+			traces := makeBenchTraces(n)
+			ctx := context.Background()
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if err := exp.ConsumeTraces(ctx, traces); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkExportProfiles measures the end-to-end encoding + flush path for profiles.
+func BenchmarkExportProfiles(b *testing.B) {
+	for _, n := range []int{1, 10, 100} {
+		b.Run(fmt.Sprintf("batch_%d", n), func(b *testing.B) {
+			server := newBenchESServer(b)
+			exp := newBenchProfilesExporter(b, server.URL)
+
+			profiles := makeBenchProfiles(n)
+			ctx := context.Background()
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if err := exp.ConsumeProfiles(ctx, profiles); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// newBenchESServer returns a test HTTP server that accepts bulk requests
+// and returns an empty success response without parsing the body.
+func newBenchESServer(b *testing.B) *httptest.Server {
+	b.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		if r.URL.Path == "/_bulk" {
+			fmt.Fprint(w, `{"took":1,"errors":false,"items":[]}`)
+		} else {
+			fmt.Fprint(w, `{"version":{"number":"8.16.0"}}`)
+		}
+	})
+	server := httptest.NewServer(mux)
+	b.Cleanup(server.Close)
+	return server
+}
+
+func newBenchConfig(url string) *Config {
+	f := NewFactory()
+	cfg := f.CreateDefaultConfig().(*Config)
+	cfg.Endpoints = []string{url}
+	cfg.QueueBatchConfig = configoptional.None[exporterhelper.QueueBatchConfig]()
+	cfg.Retry.Enabled = false
+	cfg.Compression = ""
+	return cfg
+}
+
+func newBenchLogsExporter(b *testing.B, url string) exporter.Logs {
+	b.Helper()
+	f := NewFactory()
+	exp, err := f.CreateLogs(context.Background(), exportertest.NewNopSettings(metadata.Type), newBenchConfig(url))
+	require.NoError(b, err)
+	require.NoError(b, exp.Start(context.Background(), componenttest.NewNopHost()))
+	b.Cleanup(func() { require.NoError(b, exp.Shutdown(context.Background())) })
+	return exp
+}
+
+func newBenchMetricsExporter(b *testing.B, url string) exporter.Metrics {
+	b.Helper()
+	f := NewFactory()
+	exp, err := f.CreateMetrics(context.Background(), exportertest.NewNopSettings(metadata.Type), newBenchConfig(url))
+	require.NoError(b, err)
+	require.NoError(b, exp.Start(context.Background(), componenttest.NewNopHost()))
+	b.Cleanup(func() { require.NoError(b, exp.Shutdown(context.Background())) })
+	return exp
+}
+
+func newBenchTracesExporter(b *testing.B, url string) exporter.Traces {
+	b.Helper()
+	f := NewFactory()
+	exp, err := f.CreateTraces(context.Background(), exportertest.NewNopSettings(metadata.Type), newBenchConfig(url))
+	require.NoError(b, err)
+	require.NoError(b, exp.Start(context.Background(), componenttest.NewNopHost()))
+	b.Cleanup(func() { require.NoError(b, exp.Shutdown(context.Background())) })
+	return exp
+}
+
+func newBenchProfilesExporter(b *testing.B, url string) xexporter.Profiles {
+	b.Helper()
+	f := NewFactory()
+	exp, err := f.(xexporter.Factory).CreateProfiles(context.Background(), exportertest.NewNopSettings(metadata.Type), newBenchConfig(url))
+	require.NoError(b, err)
+	require.NoError(b, exp.Start(context.Background(), componenttest.NewNopHost()))
+	b.Cleanup(func() { require.NoError(b, exp.Shutdown(context.Background())) })
+	return exp
+}
+
 func makeBenchLogs(n int) plog.Logs {
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
@@ -80,188 +219,87 @@ func makeBenchLogs(n int) plog.Logs {
 	return ld
 }
 
-// discardRoundTripper is an http.RoundTripper that accepts any request and
-// returns an empty success response.  Used in benchmarks to isolate encoding
-// cost from network I/O.
-type discardRoundTripper struct{}
-
-func (discardRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Body:       io.NopCloser(strings.NewReader(`{"took":1,"errors":false,"items":[]}`)),
-	}, nil
+func makeBenchMetrics(n int) pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "bench-service")
+	rm.Resource().Attributes().PutStr("host.name", "bench-host-01")
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("bench-scope")
+	for i := 0; i < n; i++ {
+		m := sm.Metrics().AppendEmpty()
+		m.SetName(fmt.Sprintf("bench.metric.%d", i))
+		dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.NewTimestampFromTime(
+			time.Date(2024, 1, 1, 0, 0, 0, i, time.UTC),
+		))
+		dp.SetDoubleValue(float64(i) * 1.5)
+		dp.Attributes().PutStr("host.name", "bench-host-01")
+		dp.Attributes().PutStr("region", "us-east-1")
+	}
+	return md
 }
 
-// newBenchSyncBulkIndexer creates a syncBulkIndexer backed by a discard
-// transport so that Add cost can be measured without network overhead.
-func newBenchSyncBulkIndexer(b *testing.B) *syncBulkIndexer {
-	b.Helper()
-	client, err := elastictransport.New(elastictransport.Config{
-		URLs:      nil,
-		Transport: discardRoundTripper{},
-	})
-	if err != nil {
-		b.Fatalf("elastictransport.New: %v", err)
+func makeBenchTraces(n int) ptrace.Traces {
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "bench-service")
+	rs.Resource().Attributes().PutStr("host.name", "bench-host-01")
+	ss := rs.ScopeSpans().AppendEmpty()
+	ss.Scope().SetName("bench-scope")
+	for i := 0; i < n; i++ {
+		span := ss.Spans().AppendEmpty()
+		span.SetName(fmt.Sprintf("bench-span-%d", i))
+		span.SetKind(ptrace.SpanKindServer)
+		span.SetStartTimestamp(pcommon.NewTimestampFromTime(
+			time.Date(2024, 1, 1, 0, 0, 0, i, time.UTC),
+		))
+		span.SetEndTimestamp(pcommon.NewTimestampFromTime(
+			time.Date(2024, 1, 1, 0, 0, 1, i, time.UTC),
+		))
+		span.Attributes().PutStr("http.method", "GET")
+		span.Attributes().PutStr("http.url", "/api/v1/resource")
+		span.Attributes().PutInt("http.status_code", 200)
 	}
-	tb, err := metadata.NewTelemetryBuilder(newNopTelemetrySettings())
-	if err != nil {
-		b.Fatalf("NewTelemetryBuilder: %v", err)
-	}
-	return newSyncBulkIndexer(client, createDefaultConfig().(*Config), false, tb, zap.NewNop(), nil)
+	return td
 }
 
-// BenchmarkEncodeLog_Legacy measures the production path end-to-end:
-// encode into pooled *bytes.Buffer, then Add via BulkIndexer.
-func BenchmarkEncodeLog_Legacy(b *testing.B) {
-	enc, err := newEncoder(MappingOTel)
-	if err != nil {
-		b.Fatal(err)
-	}
-	bufPool := pool.NewBufferPool()
-	ld := makeBenchLogs(benchBatchSize)
-	rl := ld.ResourceLogs().At(0)
-	sl := rl.ScopeLogs().At(0)
-	ec := encodingContext{resource: rl.Resource(), scope: sl.Scope()}
-	idx := elasticsearch.Index{Type: "logs", Dataset: "bench", Namespace: "default"}
+func makeBenchProfiles(n int) pprofile.Profiles {
+	resource := pcommon.NewResource()
+	resource.Attributes().PutStr("service.name", "bench-service")
 
-	sbi := newBenchSyncBulkIndexer(b)
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		// Start a fresh session each outer iteration to reset the internal buffer.
-		session := sbi.StartSession(context.Background()).(*syncBulkIndexerSession)
-		for j := 0; j < sl.LogRecords().Len(); j++ {
-			rec := sl.LogRecords().At(j)
-			buf := bufPool.NewPooledBuffer()
-			if err := enc.encodeLog(ec, rec, idx, buf.Buffer); err != nil {
-				b.Fatal(err)
-			}
-			if err := session.Add(
-				context.Background(),
-				"logs-bench-default", "", "", buf,
-				nil, docappender.ActionCreate,
-			); err != nil {
-				b.Fatal(err)
-			}
+	samples := make([]pprofiletest.Sample, n)
+	for i := range n {
+		samples[i] = pprofiletest.Sample{
+			Values:             []int64{int64(i + 1)},
+			TimestampsUnixNano: []uint64{uint64(time.Date(2024, 1, 1, 0, 0, 0, i, time.UTC).UnixNano())},
+			Locations: []pprofiletest.Location{{
+				Address: 0x1234,
+				Mapping: &pprofiletest.Mapping{
+					Filename:    "bench-binary",
+					MemoryStart: 0x1000,
+					MemoryLimit: 0x2000,
+				},
+				Attributes: []pprofiletest.Attribute{{Key: "profile.frame.type", Value: "native"}},
+				Line: []pprofiletest.Line{{
+					Line:     42,
+					Function: pprofiletest.Function{Name: "bench_function", Filename: "bench.go"},
+				}},
+			}},
 		}
 	}
+
+	return pprofiletest.Profiles{
+		ResourceProfiles: []pprofiletest.ResourceProfile{{
+			Resource: resource,
+			ScopeProfiles: []pprofiletest.ScopeProfile{{
+				Profiles: []pprofiletest.Profile{{
+					SampleType: pprofiletest.ValueType{Typ: "samples", Unit: "count"},
+					PeriodType: pprofiletest.ValueType{Typ: "cpu", Unit: "nanoseconds"},
+					Sample:     samples,
+				}},
+			}},
+		}},
+	}.Transform()
 }
 
-// BenchmarkEncodeLog_Buffer measures the new path:
-// encode into pooled *bytes.Buffer, then Add via bulkIndexerBuffer.
-func BenchmarkEncodeLog_Buffer(b *testing.B) {
-	enc, err := newEncoder(MappingOTel)
-	if err != nil {
-		b.Fatal(err)
-	}
-	bufPool := pool.NewBufferPool()
-	ld := makeBenchLogs(benchBatchSize)
-	rl := ld.ResourceLogs().At(0)
-	sl := rl.ScopeLogs().At(0)
-	ec := encodingContext{resource: rl.Resource(), scope: sl.Scope()}
-	idx := elasticsearch.Index{Type: "logs", Dataset: "bench", Namespace: "default"}
-
-	bib := newBulkIndexerBuffer(benchBatchSize, 512)
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		bib.Reset()
-		for j := 0; j < sl.LogRecords().Len(); j++ {
-			rec := sl.LogRecords().At(j)
-			buf := bufPool.NewPooledBuffer()
-			if err := enc.encodeLog(ec, rec, idx, buf.Buffer); err != nil {
-				b.Fatal(err)
-			}
-			if err := bib.Add(docappender.BulkIndexerItem{
-				Index:  "logs-bench-default",
-				Action: docappender.ActionCreate,
-				Body:   buf, // WriteTo writes directly into bib.data via appendWriter
-			}); err != nil {
-				b.Fatal(err)
-			}
-		}
-	}
-}
-
-// BenchmarkBulkRequestMerge measures merging two 50-item buffers into one,
-// which is what the queue batch sender does when combining under-full batches.
-func BenchmarkBulkRequestMerge(b *testing.B) {
-	enc, err := newEncoder(MappingOTel)
-	if err != nil {
-		b.Fatal(err)
-	}
-	bufPool := pool.NewBufferPool()
-	ld := makeBenchLogs(50)
-	rl := ld.ResourceLogs().At(0)
-	sl := rl.ScopeLogs().At(0)
-	ec := encodingContext{resource: rl.Resource(), scope: sl.Scope()}
-	idx := elasticsearch.Index{Type: "logs", Dataset: "bench", Namespace: "default"}
-
-	fillBuf := func() *bulkIndexerBuffer {
-		bib := newBulkIndexerBuffer(50, 512)
-		for j := 0; j < sl.LogRecords().Len(); j++ {
-			rec := sl.LogRecords().At(j)
-			buf := bufPool.NewPooledBuffer()
-			_ = enc.encodeLog(ec, rec, idx, buf.Buffer)
-			_ = bib.Add(docappender.BulkIndexerItem{
-				Index:  "logs-bench-default",
-				Action: docappender.ActionCreate,
-				Body:   buf,
-			})
-		}
-		return bib
-	}
-	a := fillBuf()
-	c := fillBuf()
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_ = a.Merge(c)
-	}
-}
-
-// BenchmarkBulkRequestSplit measures splitting a 100-item buffer into two
-// halves, which is what the queue batch sender does when a batch exceeds the
-// maximum configured size.
-func BenchmarkBulkRequestSplit(b *testing.B) {
-	enc, err := newEncoder(MappingOTel)
-	if err != nil {
-		b.Fatal(err)
-	}
-	bufPool := pool.NewBufferPool()
-	ld := makeBenchLogs(benchBatchSize)
-	rl := ld.ResourceLogs().At(0)
-	sl := rl.ScopeLogs().At(0)
-	ec := encodingContext{resource: rl.Resource(), scope: sl.Scope()}
-	idx := elasticsearch.Index{Type: "logs", Dataset: "bench", Namespace: "default"}
-
-	bib := newBulkIndexerBuffer(benchBatchSize, 512)
-	for j := 0; j < sl.LogRecords().Len(); j++ {
-		rec := sl.LogRecords().At(j)
-		buf := bufPool.NewPooledBuffer()
-		_ = enc.encodeLog(ec, rec, idx, buf.Buffer)
-		_ = bib.Add(docappender.BulkIndexerItem{
-			Index:  "logs-bench-default",
-			Action: docappender.ActionCreate,
-			Body:   buf,
-		})
-	}
-	half := bib.UncompressedLen() / 2
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_ = bib.Split(half)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Helper: nop telemetry settings for the syncBulkIndexer constructor
-// ---------------------------------------------------------------------------
-
-func newNopTelemetrySettings() component.TelemetrySettings {
-	return componenttest.NewNopTelemetrySettings()
-}

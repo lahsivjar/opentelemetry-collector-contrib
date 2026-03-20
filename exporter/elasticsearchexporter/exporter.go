@@ -471,7 +471,7 @@ func (e *elasticsearchExporter) convertLogsRequest(ctx context.Context, ld plog.
 		// converter errors in consumererror.NewPermanent, so we must not double-wrap.
 		return nil, errors.Unwrap(err)
 	}
-	bib := newBulkIndexerBuffer(ld.LogRecordCount(), 512)
+	bib := newBulkIndexerBuffer(ld.LogRecordCount(), 0)
 	var errs []error
 	for _, rl := range ld.ResourceLogs().All() {
 		resource := rl.Resource()
@@ -547,7 +547,7 @@ func (e *elasticsearchExporter) convertMetricsRequest(ctx context.Context, metri
 	if err != nil {
 		return nil, errors.Unwrap(err)
 	}
-	bib := newBulkIndexerBuffer(metrics.DataPointCount(), 512)
+	bib := newBulkIndexerBuffer(metrics.DataPointCount(), 0)
 
 	type mappingIndexKey struct {
 		mappingMode MappingMode
@@ -695,7 +695,7 @@ func (e *elasticsearchExporter) convertTracesRequest(ctx context.Context, td ptr
 	if err != nil {
 		return nil, errors.Unwrap(err)
 	}
-	bib := newBulkIndexerBuffer(td.SpanCount(), 512)
+	bib := newBulkIndexerBuffer(td.SpanCount(), 0)
 	var errs []error
 	for _, il := range td.ResourceSpans().All() {
 		resource := il.Resource()

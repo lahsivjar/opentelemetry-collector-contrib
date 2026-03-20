@@ -7,12 +7,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"testing"
 
 	docappender "github.com/elastic/go-docappender/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
 )
 
 // staticBody is a zero-allocation io.WriterTo that writes a constant string.
@@ -34,11 +36,11 @@ func makeItem(index, id, doc string) docappender.BulkIndexerItem {
 
 func TestBulkIndexerBuffer_AddAndLen(t *testing.T) {
 	buf := newBulkIndexerBuffer(4, 128)
-	require.Equal(t, 0, buf.Len())
+	require.Equal(t, 0, buf.ItemCount())
 
 	require.NoError(t, buf.Add(makeItem("idx-1", "id1", `{"a":1}`)))
 	require.NoError(t, buf.Add(makeItem("idx-2", "id2", `{"b":2}`)))
-	assert.Equal(t, 2, buf.Len())
+	assert.Equal(t, 2, buf.ItemCount())
 	assert.Positive(t, buf.UncompressedLen())
 }
 
@@ -86,12 +88,12 @@ func TestBulkIndexerBuffer_Merge(t *testing.T) {
 	require.NoError(t, b.Add(makeItem("idx", "3", `{"x":3}`)))
 
 	merged := a.Merge(b)
-	assert.Equal(t, 3, merged.Len())
+	assert.Equal(t, 3, merged.ItemCount())
 	assert.Equal(t, a.UncompressedLen()+b.UncompressedLen(), merged.UncompressedLen())
 
 	// Source buffers must be unmodified.
-	assert.Equal(t, 2, a.Len())
-	assert.Equal(t, 1, b.Len())
+	assert.Equal(t, 2, a.ItemCount())
+	assert.Equal(t, 1, b.ItemCount())
 
 	// Merged bytes = a.Bytes() + b.Bytes()
 	expected := append(a.Bytes(), b.Bytes()...)
@@ -107,18 +109,17 @@ func TestBulkIndexerBuffer_Split(t *testing.T) {
 
 	total := buf.UncompressedLen()
 	// Split so that each part is at most just over half the total.
-	parts := buf.Split(total/2 + 1)
+	parts := buf.splitByBytes(total/2 + 1)
 	require.GreaterOrEqual(t, len(parts), 2)
 
-	// All items must be present across all parts, byte-for-byte.
+	// All items must be present across all parts (order may differ due to
+	// the last-partition-smallest swap).
 	totalItems := 0
-	var combined []byte
 	for _, p := range parts {
-		totalItems += p.Len()
-		combined = append(combined, p.Bytes()...)
+		totalItems += p.ItemCount()
 	}
 	assert.Equal(t, 6, totalItems)
-	assert.Equal(t, buf.Bytes(), combined)
+	assertSameItems(t, buf, parts)
 }
 
 func TestBulkIndexerBuffer_SplitSingleItemExceedsMax(t *testing.T) {
@@ -126,9 +127,9 @@ func TestBulkIndexerBuffer_SplitSingleItemExceedsMax(t *testing.T) {
 	require.NoError(t, buf.Add(makeItem("idx", "big", `{"data":"`+strings.Repeat("x", 200)+`"}`)))
 
 	// maxBytes smaller than item — item must still appear in exactly one sub-buffer.
-	parts := buf.Split(10)
+	parts := buf.splitByBytes(10)
 	require.Len(t, parts, 1)
-	assert.Equal(t, 1, parts[0].Len())
+	assert.Equal(t, 1, parts[0].ItemCount())
 	assert.Equal(t, buf.Bytes(), parts[0].Bytes())
 }
 
@@ -138,27 +139,23 @@ func TestBulkIndexerBuffer_SplitPreservesBytes(t *testing.T) {
 		require.NoError(t, buf.Add(makeItem("idx", fmt.Sprintf("%d", i), `{"v":1}`)))
 	}
 
-	parts := buf.Split(1) // force each item into its own sub-buffer
+	parts := buf.splitByBytes(1) // force each item into its own sub-buffer
 	require.Len(t, parts, 4)
-	var combined []byte
-	for _, p := range parts {
-		combined = append(combined, p.Bytes()...)
-	}
-	assert.Equal(t, buf.Bytes(), combined)
+	assertSameItems(t, buf, parts)
 }
 
 func TestBulkIndexerBuffer_Reset(t *testing.T) {
 	buf := newBulkIndexerBuffer(4, 128)
 	require.NoError(t, buf.Add(makeItem("idx", "1", `{"a":1}`)))
-	assert.Equal(t, 1, buf.Len())
+	assert.Equal(t, 1, buf.ItemCount())
 
 	buf.Reset()
-	assert.Equal(t, 0, buf.Len())
+	assert.Equal(t, 0, buf.ItemCount())
 	assert.Equal(t, 0, buf.UncompressedLen())
 
 	// Adding after reset should work and produce the same bytes.
 	require.NoError(t, buf.Add(makeItem("idx", "2", `{"b":2}`)))
-	assert.Equal(t, 1, buf.Len())
+	assert.Equal(t, 1, buf.ItemCount())
 }
 
 func TestBulkIndexerBuffer_Clone(t *testing.T) {
@@ -170,7 +167,7 @@ func TestBulkIndexerBuffer_Clone(t *testing.T) {
 
 	// Mutating the original must not affect the clone.
 	require.NoError(t, buf.Add(makeItem("idx", "2", `{"b":2}`)))
-	assert.Equal(t, 1, cloned.Len())
+	assert.Equal(t, 1, cloned.ItemCount())
 }
 
 func TestBulkIndexerBuffer_InvalidAction(t *testing.T) {
@@ -182,7 +179,7 @@ func TestBulkIndexerBuffer_InvalidAction(t *testing.T) {
 	})
 	require.Error(t, err)
 	// Buffer must remain clean after the error.
-	assert.Equal(t, 0, buf.Len())
+	assert.Equal(t, 0, buf.ItemCount())
 	assert.Equal(t, 0, buf.UncompressedLen())
 }
 
@@ -202,6 +199,40 @@ func TestBulkIndexerBuffer_ImplementsInterface(t *testing.T) {
 	var _ docappender.BulkIndexerBuffer = (*bulkIndexerBuffer)(nil)
 }
 
+func TestSplitByBytes_LastPartitionIsSmallest(t *testing.T) {
+	buf := newBulkIndexerBuffer(4, 128)
+	// Add items with varying body sizes so the greedy algorithm would
+	// otherwise produce a small first partition and a larger last one.
+	require.NoError(t, buf.Add(makeItem("idx", "", `{"s":1}`)))         // small
+	require.NoError(t, buf.Add(makeItem("idx", "", strings.Repeat("x", 200)))) // large
+	require.NoError(t, buf.Add(makeItem("idx", "", strings.Repeat("y", 100)))) // medium
+
+	// Choose maxBytes so that item 0 is forced into its own small partition.
+	_, _, de0 := buf.itemBounds(0)
+	as1, _, _ := buf.itemBounds(1)
+	item0Size := int(de0 - 0)
+	item1Size := int(buf.offsets[1*3+2] - as1)
+	maxBytes := item0Size + item1Size - 1 // too small for item0 + item1 together
+
+	parts := buf.splitByBytes(maxBytes)
+	require.Greater(t, len(parts), 1)
+
+	lastSize := parts[len(parts)-1].UncompressedLen()
+	for i, p := range parts[:len(parts)-1] {
+		assert.LessOrEqual(t, lastSize, p.UncompressedLen(),
+			"last partition (size %d) must be <= partition %d (size %d)",
+			lastSize, i, p.UncompressedLen())
+	}
+}
+
+func TestMergeSplit_EmptyBufferReturnsNonEmptySlice(t *testing.T) {
+	req := &bulkIndexerRequest{buf: newBulkIndexerBuffer(0, 0)}
+	reqs, err := req.MergeSplit(t.Context(), 100, exporterhelper.RequestSizerTypeBytes, nil)
+	require.NoError(t, err)
+	require.Len(t, reqs, 1)
+	assert.Equal(t, 0, reqs[0].ItemsCount())
+}
+
 func TestSubBufferAppendIsolation(t *testing.T) {
 	buf := newBulkIndexerBuffer(4, 64)
 	require.NoError(t, buf.Add(makeItem("idx", "1", `{"a":1}`)))
@@ -218,4 +249,29 @@ func TestSubBufferAppendIsolation(t *testing.T) {
 
 	assert.Equal(t, siblingBefore, string(parts[1].Bytes()),
 		"append to one sub-buffer must not corrupt sibling sub-buffers")
+}
+
+// assertSameItems verifies that the partitions contain exactly the same
+// ndjson items as the original buffer, regardless of partition order.
+// Each item's raw bytes (action line + body line) are extracted using
+// itemBounds so the comparison is structure-aware.
+func assertSameItems(t *testing.T, orig *bulkIndexerBuffer, parts []*bulkIndexerBuffer) {
+	t.Helper()
+	// extractRawItems returns each item's raw bytes (action+body) as strings.
+	extractRawItems := func(b *bulkIndexerBuffer) []string {
+		out := make([]string, b.ItemCount())
+		for i := range b.ItemCount() {
+			as, _, de := b.itemBounds(i)
+			out[i] = string(b.data[as:de])
+		}
+		return out
+	}
+	expected := extractRawItems(orig)
+	var actual []string
+	for _, p := range parts {
+		actual = append(actual, extractRawItems(p)...)
+	}
+	sort.Strings(expected)
+	sort.Strings(actual)
+	assert.Equal(t, expected, actual)
 }

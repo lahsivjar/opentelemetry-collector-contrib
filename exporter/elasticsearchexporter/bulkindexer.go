@@ -180,7 +180,7 @@ type syncBulkIndexer struct {
 func (s *syncBulkIndexer) StartSession(context.Context) bulkIndexerSession {
 	return &syncBulkIndexerSession{
 		s:   s,
-		bib: newBulkIndexerBuffer(256, 512),
+		bib: newBulkIndexerBuffer(0, 0),
 	}
 }
 

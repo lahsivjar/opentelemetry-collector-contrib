@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 
 	docappender "github.com/elastic/go-docappender/v2"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
@@ -23,7 +24,7 @@ type bulkIndexerRequest struct {
 
 var _ xexporterhelper.Request = (*bulkIndexerRequest)(nil)
 
-func (r *bulkIndexerRequest) ItemsCount() int { return r.buf.Len() }
+func (r *bulkIndexerRequest) ItemsCount() int { return r.buf.ItemCount() }
 func (r *bulkIndexerRequest) BytesSize() int  { return r.buf.UncompressedLen() }
 
 func (r *bulkIndexerRequest) MergeSplit(
@@ -33,7 +34,7 @@ func (r *bulkIndexerRequest) MergeSplit(
 	other xexporterhelper.Request,
 ) ([]xexporterhelper.Request, error) {
 	merged := r.buf
-	if other != nil {
+	if other != nil && other.ItemsCount() > 0 {
 		o, ok := other.(*bulkIndexerRequest)
 		if !ok {
 			return nil, errors.New("invalid request type for MergeSplit")
@@ -48,13 +49,16 @@ func (r *bulkIndexerRequest) MergeSplit(
 	var parts []*bulkIndexerBuffer
 	switch sizerType {
 	case exporterhelper.RequestSizerTypeBytes:
-		parts = merged.Split(maxSize)
+		parts = merged.splitByBytes(maxSize)
 	case exporterhelper.RequestSizerTypeItems:
 		parts = merged.splitByItems(maxSize)
 	default:
 		return []xexporterhelper.Request{&bulkIndexerRequest{buf: merged}}, nil
 	}
 
+	if len(parts) == 0 {
+		return []xexporterhelper.Request{&bulkIndexerRequest{buf: merged}}, nil
+	}
 	reqs := make([]xexporterhelper.Request, len(parts))
 	for i, p := range parts {
 		reqs[i] = &bulkIndexerRequest{buf: p}
@@ -132,8 +136,8 @@ func (b *bulkIndexerBuffer) Add(item docappender.BulkIndexerItem) error {
 	return nil
 }
 
-// Len returns the number of items stored in the buffer.
-func (b *bulkIndexerBuffer) Len() int {
+// ItemCount returns the number of items in the buffer.
+func (b *bulkIndexerBuffer) ItemCount() int {
 	return len(b.offsets) / 3
 }
 
@@ -189,16 +193,16 @@ func (b *bulkIndexerBuffer) Merge(other *bulkIndexerBuffer) *bulkIndexerBuffer {
 	return &bulkIndexerBuffer{data: newData, offsets: newOffsets}
 }
 
-// Split partitions the buffer into sub-buffers each of which has an
+// splitByBytes partitions the buffer into sub-buffers each of which has an
 // UncompressedLen no greater than maxBytes (unless a single item exceeds
 // maxBytes, in which case it occupies its own sub-buffer).
 //
-// The returned sub-buffers share the backing array of b.data and b.offsets —
-// no bytes are copied. They must not outlive the source buffer if the source
-// buffer is reset or garbage-collected. For long-lived slices, call Clone on
-// the returned sub-buffers.
-func (b *bulkIndexerBuffer) Split(maxBytes int) []*bulkIndexerBuffer {
-	n := b.Len()
+// The returned sub-buffers share the backing array of b.data — no bytes are
+// copied. They must not outlive the source buffer if the source buffer is
+// reset or garbage-collected. For long-lived slices, call Clone on the
+// returned sub-buffers.
+func (b *bulkIndexerBuffer) splitByBytes(maxBytes int) []*bulkIndexerBuffer {
+	n := b.ItemCount()
 	if n == 0 {
 		return nil
 	}
@@ -207,30 +211,49 @@ func (b *bulkIndexerBuffer) Split(maxBytes int) []*bulkIndexerBuffer {
 		return []*bulkIndexerBuffer{b}
 	}
 
-	var result []*bulkIndexerBuffer
-	startItem := 0
-	accumulated := 0
-
+	var (
+		result      []*bulkIndexerBuffer
+		startItem   int
+		minIdx      int
+		accumulated int
+		minSize     int
+	)
+	minSize = math.MaxInt
 	for i := 0; i < n; i++ {
 		as, _, de := b.itemBounds(i)
 		itemSize := int(de - as)
 
 		if accumulated+itemSize > maxBytes && startItem < i {
-			result = append(result, b.subBuffer(startItem, i))
+			part := b.subBuffer(startItem, i)
+			if accumulated < minSize {
+				minSize = accumulated
+				minIdx = len(result)
+			}
+			result = append(result, part)
 			startItem = i
 			accumulated = 0
 		}
 		accumulated += itemSize
 	}
-	// Append the remainder.
 	result = append(result, b.subBuffer(startItem, n))
+
+	// Ensure the last partition is the smallest to satisfy the MergeSplit contract.
+	if len(result) > 1 && minSize < accumulated {
+		last := len(result) - 1
+		result[minIdx], result[last] = result[last], result[minIdx]
+	}
 	return result
 }
 
 // splitByItems partitions the buffer into sub-buffers each holding at most
-// maxItems items. Uses the existing subBuffer (zero-copy, offset-rebasing).
+// maxItems items.
+//
+// The returned sub-buffers share the backing array of b.data — no bytes are
+// copied. They must not outlive the source buffer if the source buffer is
+// reset or garbage-collected. For long-lived slices, call Clone on the
+// returned sub-buffers.
 func (b *bulkIndexerBuffer) splitByItems(maxItems int) []*bulkIndexerBuffer {
-	n := b.Len()
+	n := b.ItemCount()
 	if n == 0 || maxItems <= 0 {
 		return nil
 	}
@@ -250,11 +273,18 @@ func (b *bulkIndexerBuffer) splitByItems(maxItems int) []*bulkIndexerBuffer {
 }
 
 // subBuffer returns a zero-copy view of items [from, to).
+//
+// The data slice is sub-sliced with a three-index expression
+// (b.data[start:end:end]) to cap capacity, preventing appends from
+// corrupting sibling sub-buffers. The offsets are rebased so they are
+// relative to the sub-slice's data.
+//
+// The returned sub-buffer shares the backing array of b.data and must not
+// outlive the source buffer. For long-lived slices, call Clone.
 func (b *bulkIndexerBuffer) subBuffer(from, to int) *bulkIndexerBuffer {
 	if from >= to {
 		return &bulkIndexerBuffer{}
 	}
-	// Byte range: action start of 'from' → doc end of 'to-1'.
 	dataStart := b.offsets[from*3]
 	dataEnd := b.offsets[(to-1)*3+2]
 
