@@ -108,10 +108,7 @@ func (sm *signalToMetrics) ConsumeTraces(ctx context.Context, td ptrace.Traces) 
 						resAttrsCache[mdIdx] = md.FilterResourceAttributes(resourceAttrs, resolvedResAttrs, sm.collectorInstanceInfo)
 					}
 
-					filterAttrs := func() (pcommon.Map, error) {
-						return md.FilterAttributes(spanAttrs, resolvedAttrs), nil
-					}
-					err = aggregator.Aggregate(ctx, tCtx, md, resAttrsCache[mdIdx], attrID, filterAttrs, 1)
+					err = aggregator.Aggregate(ctx, tCtx, md, resAttrsCache[mdIdx], spanAttrs, attrID, resolvedAttrs, 1)
 					tCtx.Close()
 					if err != nil {
 						return err
@@ -185,10 +182,7 @@ func (sm *signalToMetrics) ConsumeMetrics(ctx context.Context, m pmetric.Metrics
 								return nil
 							}
 						}
-						filterAttrs := func() (pcommon.Map, error) {
-							return md.FilterAttributes(dpAttrs, resolvedAttrs), nil
-						}
-						return aggregator.Aggregate(ctx, tCtx, md, resAttrsCache[mdIdx], attrID, filterAttrs, 1)
+						return aggregator.Aggregate(ctx, tCtx, md, resAttrsCache[mdIdx], dpAttrs, attrID, resolvedAttrs, 1)
 					}
 
 					//exhaustive:enforce
@@ -303,10 +297,7 @@ func (sm *signalToMetrics) ConsumeLogs(ctx context.Context, logs plog.Logs) erro
 						resAttrsCache[mdIdx] = md.FilterResourceAttributes(resourceAttrs, resolvedResAttrs, sm.collectorInstanceInfo)
 					}
 
-					filterAttrs := func() (pcommon.Map, error) {
-						return md.FilterAttributes(logAttrs, resolvedAttrs), nil
-					}
-					err = aggregator.Aggregate(ctx, tCtx, md, resAttrsCache[mdIdx], attrID, filterAttrs, 1)
+					err = aggregator.Aggregate(ctx, tCtx, md, resAttrsCache[mdIdx], logAttrs, attrID, resolvedAttrs, 1)
 					tCtx.Close()
 					if err != nil {
 						return err
@@ -384,10 +375,7 @@ func (sm *signalToMetrics) ConsumeProfiles(ctx context.Context, profiles pprofil
 						resAttrsCache[mdIdx] = md.FilterResourceAttributes(resourceAttrs, resolvedResAttrs, sm.collectorInstanceInfo)
 					}
 
-					filterAttrs := func() (pcommon.Map, error) {
-						return md.FilterAttributes(profileAttrs, resolvedAttrs), nil
-					}
-					if err := aggregator.Aggregate(ctx, tCtx, md, resAttrsCache[mdIdx], attrID, filterAttrs, 1); err != nil {
+					if err := aggregator.Aggregate(ctx, tCtx, md, resAttrsCache[mdIdx], profileAttrs, attrID, resolvedAttrs, 1); err != nil {
 						tCtx.Close()
 						return err
 					}
